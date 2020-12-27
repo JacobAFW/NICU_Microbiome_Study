@@ -2,7 +2,11 @@
 Microbiome analysis and associated data.
 
 This repo contains supplementary data for the manuscript titled "Characterising the bacterial gut microbiome of very preterm infants". 
-This includes the workflow, metadata and some addtional outputs from analyses.
+This includes: 
+
+ - The full workflow from raw reads to analysis. 
+ - The metadata (deidentified).
+ - Some additional outputs from the analysis that may be of interest.
 
 ## Summary of methods
 ### Lab protocols
