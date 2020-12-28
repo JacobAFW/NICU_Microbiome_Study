@@ -1,13 +1,14 @@
 # NICU_Microbiome_Study
 Microbiome analysis and associated data.
 
-This repo contains supplementary data for the manuscript titled "Characterising the bacterial gut microbiome of very preterm infants". 
+This repo contains supplementary data for the manuscript "Characterising the bacterial gut microbiome of very preterm infants". 
 This includes: 
 
- - The full workflow from raw reads to analysis. 
+ - The full workflow, from raw reads to analysis. 
  - The metadata (deidentified).
 
-## Summary of methods
+For context, below is a summary of the methods used in this study.
+
 ### Lab protocols
  - DNA extraction was conducted using the Bioline ISOLATE Fecal DNA Kit, with modifications made in consultation with the manufacturer to optimise DNA yield. This included increased beta-mercaptoethanol (from 0.5 to 1% to increase DNA solubility and reduce secondary structure formation), addition of an extra wash step (to improve purity) and decreased elution buffer volume (to increase final DNA concentration). 
  - For library preparation we followed the Illumina metagenomics library preparation protocol, using the Index Kit v2 C, along with Platinum™ SuperFi™ PCR Master Mix. 
