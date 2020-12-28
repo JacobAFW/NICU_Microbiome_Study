@@ -1,0 +1,1681 @@
+---
+title: "Workflow for *Characterising the bacterial gut microbiome of probiotic-supplemented very-preterm infants*"
+author: "Jacob Westaway"
+date: "Last updated on `r Sys.Date()`"
+output:
+  pdf_document: 
+    toc: true
+    toc_depth: 2
+    number_sections: true
+header-includes:
+  \usepackage{float}
+  \floatplacement{figure}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+\newpage
+
+# About.
+
+This document contains the workflow for the manuscript *Characterising the bacterial gut microbiome of probiotic-supplemented very-preterm infants*, and includes the bioinformatics pipeline to go from raw reads to interpretable abundances, based largely around this [DADA2](https://pubmed.ncbi.nlm.nih.gov/27508062/) workflow developed by *Callahan, et al.*) worfklow, removal of contamination with [MicroDecon](https://onlinelibrary.wiley.com/doi/full/10.1002/edn3.11), and the analysis using a combination of the packages [phloseq](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0061217), [DESeq2](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-014-0550-8), [lme4](https://cran.r-project.org/web/packages/lme4/vignettes/lmer.pdf), amongst many others.
+
+# Bioinformatics Pipeline.
+
+## About.
+
+Creating an ASV table from raw reads, using [DADA2](https://pubmed.ncbi.nlm.nih.gov/27508062/).
+
+## Load required packages.
+
+```{r, warning=F, message=F, results='hide'}
+sapply(c("dada2", "phyloseq", "DECIPHER", "phangorn", "BiocManager", "BiocStyle", 
+        "Biostrings", "ShortRead", "ggplot2", "gridExtra", "knitr","tibble"), 
+        require, character.only = TRUE)
+```
+
+## Read quality.
+
+### Organise forward and reverse fastq filenames into own lists (check file format).
+ - First define the file path to the directory containing the fastq files (we will use this several times).
+ 
+```{r, warning=F, message=F}
+path <-"Data/"
+
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq.gz", full.names = TRUE))
+
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq.gz", full.names = TRUE))
+```
+
+### Extract sample names.
+
+```{r, warning=F, message=F}
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+\newpage
+
+### Check quality of Forward and Reverse Reads (used to define truncLen in filtering).
+
+```{r, warning=F, fig.cap="Quality of forward reads.", message=F, fig.height = 3, fig.width = 3, fig.align = "center"}
+plotQualityProfile(fnFs[1:2])
+```
+
+```{r, warning=F, fig.cap="Quality of reverse reads.", message=F}
+plotQualityProfile(fnRs[1:2])
+```
+
+### Assign names for filtered reads.
+
+```{r, warning=F, message=F}
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+```
+
+### Filter and trim the reads. 
+ - Paremeters based on data and quality plots. 
+ - `truncLean` defined by when quality plots begin to drop off, but ensuring it is large enough to maintain read overlap (=>20bp) downstream.
+ - `trimLeft = c(16,21)` is used to remove primers (16 and 21 are F and R primer length).
+ - `maxEE = c(2,2)` is for filtering, where the higher the value the more relaxed filtering,allowing more reads to get through. 
+ - Good quality data should allow for more stringent parameters (2 is stringent).
+ - The number of reads filtered is checked. If reads are too low, can alter parameters.
+ 
+```{r, warning=F, message=F}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen = c(280,200), 
+                     trimLeft = c(16,21), 
+                     maxN = 0, 
+                     maxEE = c(2,2), 
+                     truncQ = 2, 
+                     rm.phix = TRUE,
+                     compress = TRUE, 
+                     multithread = FALSE) # windows can't support multithread
+head(out)
+```
+
+## Infer sequence variants.
+
+### Calculate Error Rates.
+ - Error rates are used for sample ineference downstream.
+ 
+```{r, warning=F, message=F, results='hide'}
+errF <- learnErrors(filtFs, multithread=TRUE)
+
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+### Plot error rates. 
+ - Estimated error rates (black line) should be a good fit to observed rates (points) and error should decrease.
+ 
+```{r, warning=F, fig.cap="Error rates for forward reads", message=F}
+plotErrors(errF, nominalQ=TRUE)
+```
+
+```{r, warning=F, fig.cap="Error rates for reverse reads.", message=F}
+plotErrors(errR, nominalQ=TRUE)
+```
+
+### Dereplication.
+ - Combine indentical sequences into unique sequence bins.
+ - Name the derep-class objects by the sample name.
+ 
+```{r, warning=F, message=F}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+names(derepFs) <- sample.names
+
+names(derepRs) <- sample.names
+```
+
+### Sample Inference.
+
+```{r, warning=F, message=F, results='hide'}
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+```
+
+### Inspect denoised data.
+
+```{r, warning=F, message=F, results='hide'}
+dadaFs[[1]]
+
+dadaRs[[1]]
+```
+
+### Merge Paired Reads and inspect merged data.
+ - Removes paired reads that do not perfectly overlap.
+ - Arguments represent infered samples AND denoised reads.
+ 
+```{r, warning=F, message=F, results='hide'}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+```
+
+## Construct amplicon sequence variance (ASV) table and remove chimeras.
+
+### Construct ASV table.
+ - Check dimentions and inspect distribution of sequence lengths.
+ 
+```{r, warning=F, message=F, results='hide'}
+seqtab <- makeSequenceTable(mergers)
+
+dim(seqtab)
+
+table(nchar(getSequences(seqtab)))
+```
+
+### Merging multiple sequence runs.
+ - Merging must be done after filtering.
+ - *seqtab.pilot* is a pilot dataset that was included in the overall analysis.
+ 
+```{r, include=F}
+# Reading in pilot data for rmd.
+seqtab.pilot <- read.csv("Pipeline_Graphs/seqtab.pilot", row.names = 1) %>%
+  as.matrix()
+```
+ 
+```{r, warning=F, message=F}
+seqtab.merged <- mergeSequenceTables(seqtab, seqtab.pilot)
+```
+
+### Remove chimeras.
+```{r, warning=F, message=F}
+seqtab.nochim <- removeBimeraDenovo(seqtab.merged, method="consensus", 
+                                    multithread=TRUE, verbose=TRUE)
+```
+
+### Track reads through pipeline.
+
+```{r, warning=F, message=F}
+getN <- function(x) sum(getUniques(x))
+
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), 
+               sapply(mergers, getN), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+
+rownames(track) <- sample.names
+
+head(track)
+```
+
+## Contamination removal with *MicroDecon*.
+
+```{r, warning=F, message=F}
+library(microDecon)
+```
+ 
+### Reformat data for *MicroDecon*.
+ - Transpose sequencing table (post chimera removal) and convert to a dataframe.
+ 
+```{r, warning=F, results='hide', message=F}
+microdecon.df <- t(seqtab.nochim) %>%
+  as.data.frame()
+```
+
+ - Determine which columns the blank samples belong to (for the second half of micrdecon(), otherwise an error occurs).
+ 
+```{r, eval=F}
+which(colnames(microdecon.df)=="183" | colnames(microdecon.df)=="182" | 
+        colnames(microdecon.df)=="181" | colnames(microdecon.df)=="179" | 
+        colnames(microdecon.df)=="145" | colnames(microdecon.df)=="99")
+```
+ 
+ - Make blank samples the first 6 columns.
+ - Remove blanks 99 (column 6) and 145 (column 5) (blanks 99 and 145 are both distinct from the other blanks, and appear to be contaminated by adjacent samples sometime during library prepeartion, so we will remove these two blanks prior to running MicroDecon).
+ 
+```{r, warning=F, results='hide', message=F}
+microdecon.df.blanks <- cbind.data.frame(microdecon.df[,c("183", "182", "181", 
+                                                          "179", "145", "99")],
+                                         microdecon.df[, -c(84, 83, 82, 80, 46, 165)])
+
+microdecon.df.blanks.2 <- microdecon.df.blanks[,-c(6, 5)]
+```
+
+ - Can check how many columns were removed with `ncol(microdecon.df.blanks) - ncol(microdecon.df.blanks.2)`.
+
+### Restructure dataframe to a priori grouping.
+ - Read in "ColNames.csv", which has the column names from the metadata restructured (as rows in column A of an excel spreadsheet) so that they are in the below priori groupings:
+    - NICU Admission
+    - NICU Discharge
+    - NICU Unknown
+    - SCN
+    - Other
+ - When read in, the data should look like this:
+ 
+`V1`  
+`<fctr>`  
+`179`				
+`181`				
+`182`				
+`183`				
+`2`				
+`3`				
+`6`				
+`3b`				
+`20`				
+`21`
+
+ - Then reorder the microdecon.df.blanks.2 by the imported csv file.
+ - **NB.** this can be done using the *tidyverse* but it is also convoluted.
+ 
+```{r, warning=F, message=F, results='hide'}
+col.names <- read.csv("ColNames.csv", header = FALSE)
+
+col.order <- col.names[,1]
+
+microdecon.df.3 <- microdecon.df.blanks.2[,match(col.order, 
+                   colnames(microdecon.df.blanks.2))]
+```
+
+#### Make column 1 the ASV/OTU names.
+ - *MicroDecon* requires that the OTUs have a unique ID in column 1.
+ - Take the rownames from microdecon.df.3 and create a column with these names.
+ - Can check with `length(unique(microdecon.df.3.names[,1])) == nrow(microdecon.df.3)`.
+ 
+```{r, warning=F, message=F}
+microdecon.df.3.names <- cbind.data.frame(rownames(microdecon.df.3), microdecon.df.3)
+```
+
+### Decontaminate data using `decon()`.
+ - `numb.ind` is the number of columns for each priori grouping.
+ - `taxa = F` as there is no taxonomy in the dataframe.
+ 
+```{r, warning=F, message=F}
+decontaminated <- decon(data = microdecon.df.3.names, numb.blanks = 4, 
+                  numb.ind = c(68, 66, 9, 14, 8), taxa = F)
+```
+
+#### Check *MicroDecon* Outputs.
+```{r, eval=F, message=F}
+decontaminated$decon.table
+decontaminated$reads.removed
+decontaminated$OTUs.removed
+decontaminated$mean.per.group
+decontaminated$sum.per.group
+```
+
+### Reformat decon.table.
+ - Convert column 1 to row names.
+ - Remove blank average column (1).
+ - Save rownames as seperate vector to be added back, as row names are removed during apply().
+ - Convert numeric values to integers (for downstream analysis).
+ - Transpose data.
+ 
+```{r, warning=F, message=F}
+seqtab.microdecon <- decontaminated$decon.table %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "rownames(microdecon.df.3)")
+
+seqtab.microdecon <- seqtab.microdecon[,-1]
+
+save.rows <- rownames(seqtab.microdecon)
+
+seqtab.microdecon <- apply(seqtab.microdecon,2,as.integer)
+
+rownames(seqtab.microdecon) <- save.rows
+
+seqtab.microdecon <- t(seqtab.microdecon)
+```
+
+## Assign taxonomy.
+ - With optional species addition (there is an agglomeration step downstream, so you can add species now for curiosities sake, and remove later for analysis).
+ 
+```{r, warning=F, message=F}
+taxa <- assignTaxonomy(seqtab.microdecon, "silva_nr_v132_train_set.fa.gz")
+
+taxa <- addSpecies(taxa, "silva_species_assignment_v132.fa.gz")  
+
+taxa.print <- taxa # Removes sequence rownames for display only
+rownames(taxa.print) <- NULL
+```
+
+# Preprocessing: Creating a Phyloseq Object.
+
+## About.
+Creating a [phyloseq](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0061217) object to be used for analysis, and create different objects to be used for different types of analysis downstream.
+
+## Load required packages. 
+
+```{r, warning=F, message=F, results='hide'}
+sapply(c( "shiny","miniUI", "caret", "pls", "e1071", "ggplot2", 
+    "randomForest", "dplyr", "ggrepel", "nlme", "devtools", 
+    "reshape2", "PMA", "structSSI", "ade4","ggnetwork", 
+    "intergraph", "scales", "readxl", "genefilter", "impute", 
+    "phyloseq", "phangorn", "dada2", "DECIPHER", "gridExtra"), 
+    require, character.only = TRUE)
+```
+
+## Constuct a phylogenetic tree (for Phyloseq object downstream, required for distance measures).
+ - Peform multiple-allignment.
+ - `pml` calculates the likelihood of a given tree, and then `optim.pml()` optimizes the tree topology and branch length for the selected model (GTR+G+I max tree).
+
+```{r, warning=F, message=F, results='hide'}
+seqs <- getSequences(seqtab.microdecon)
+
+names(seqs) <- seqs 
+
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA, verbose=FALSE)
+
+phangAlign <- phyDat(as(alignment, "matrix"), type = "DNA")
+
+fitGTR <- phangAlign %>%
+  dist.ml() %>%
+  NJ() %>%
+  pml(data = phangAlign) %>%
+  update(k = 4, inv = 0.2) %>%
+  optim.pml(model = "GTR", optInv = TRUE, optGamma = TRUE, 
+  rearrangement = "NNI", control = pml.control(trace = 0))
+
+detach("package:phangorn", unload = TRUE) # conflicts downstream
+```
+
+## Import metadata and construct dataframe.
+ - Use ID column for row names.
+
+```{r, warning=F, message=F, results='hide'}
+samdf <- read_excel("SAMPLE_INFORMATION.xlsx", sheet = 1, 
+         col_names = TRUE, col_types = NULL, skip = 0) %>%
+         data.frame(row.names = "ID")
+```
+
+## Constrcut the Phyloseq object.
+ - Includes: metadata, ASV table, taxonomy table and phylogenetic tree.
+ 
+```{r, warning=F, message=F, results='hide'}
+ps <- phyloseq(otu_table(seqtab.microdecon, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa),
+               phy_tree(fitGTR$tree))
+```
+
+## Wrangling the metadata.
+ - And do some additional wrangling.
+ - Convert chraracters to factors.
+ - Duplicate the label column, and then convert to newly created duplicate into rownames (need the original column downstream).
+
+```{r, warning=F, message=F, results='hide'}
+sample_data(ps) <- sample_data(ps) %>%
+  unclass() %>%
+  as.data.frame() %>%
+  mutate_if(is.character, as.factor) %>%
+  mutate("Label2" = Label) %>% 
+  column_to_rownames("Label2") %>%
+  dplyr::rename(Diabetes = Diabetetes) 
+```
+
+## Filtering and normalisation.
+
+### Taxonomy filtering.
+ - Can check the number of phyla before and after transformation with `table(tax_table(ps)[, "Phylum"], exclude = NULL)`.
+ - Remove features with ambiguous and NA phylum annotation.
+
+```{r, warning=F, message=F, results='hide'}
+ps <- subset_taxa(ps, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+```
+
+### Prevelance filtering.
+ - Using an unsupervised method (relying on the data in this experiment) explore the prevelance of features in the dataset.
+ - Calculate the prevalence of each feature and store as a dataframe.
+ - Add taxonomy and total read counts.
+ 
+```{r, warning=F, message=F, results='hide'}
+prevdf = apply(X = otu_table(ps),
+               MARGIN = ifelse(taxa_are_rows(ps), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(ps),
+                    tax_table(ps))
+```
+
+ - Plot the relationship between prevelance and total read count for each feature. This provides information on outliers and ranges of features.
+ 
+```{r, warning=F, message=F, fig.cap="Scatterplot exploring the relationship between prevelance and abundance of phyla."}
+prevdf %>%
+  subset(Phylum %in% get_taxa_unique(ps, "Phylum")) %>%
+  ggplot(aes(TotalAbundance, Prevalence / nsamples(ps),color=Phylum)) +
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 1) +  
+  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  
+  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+ - Define prevalence threshold based on the plot (~1% is standard) and apply to ps object (if prevelance is too low don't designate a threshold).
+ 
+```{r, warning=F, message=F, results='hide'}
+prevalenceThreshold = 0.01 * nsamples(ps)
+
+keepTaxa = rownames(prevdf)[(prevdf$Prevalence >= prevalenceThreshold)]
+
+ps2 = prune_taxa(keepTaxa, ps)
+```
+
+ - Explore the relationship on the filtered data set.
+```{r, warning=F, message=F, fig.cap="Scatterplot exploring the relationship between prevelance and abundance of phyla on data passed through a prevalence threshold."}
+prevdf %>%
+  subset(Phylum %in% get_taxa_unique(ps2, "Phylum")) %>%
+  ggplot(aes(TotalAbundance, Prevalence / nsamples(ps2),color=Phylum)) +
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 1) +  
+  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  
+  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+### Aggolmerate taxa.
+ - Combine features that descend from the same genus as most species have not been identified due to the poor sequencing depth in 16S.
+ - Can check how many genera would be present after filtering by running `length(get_taxa_unique(ps2, taxonomic.rank = "Genus"))`, and `ntaxa(ps3)` will give the number of post agglomeration taxa.
+ 
+```{r, warning=F, message=F, results='hide'}
+ps3 = tax_glom(ps2, "Genus", NArm = TRUE)
+```
+
+ - Create tree plots to observe pre and post agglomeration.
+ 
+```{r, warning=F, message=F, fig.cap="Tree plots exploring the agglomeration of taxa at the genus level."}
+grid.arrange(nrow = 1, 
+    (plot_tree(ps2, method = "treeonly",
+      ladderize = "left", title = "Before Agglomeration") +
+      theme(plot.title = element_text(size = 15))), 
+    (plot_tree(ps3, method = "treeonly",
+      ladderize = "left", title = "Post Genus Agglomeration") +
+      theme(plot.title = element_text(size = 15))))
+```
+
+### Normalisation.
+
+ - Plot a refraction curve to see if total sum scaling will surfice.
+ - Define colours and lines.
+ - Step = step size for sample sizes in rarefaction curve.
+ 
+```{r, warning=F, message=F}
+vegan::rarecurve(t(otu_table(ps3)), step = 20, label = FALSE, main = "Rarefaction Curve", 
+        col = c("black", "darkred", "forestgreen", "orange", "blue", "yellow", "hotpink"))
+```
+
+ - Perform total sum scaling on agglomerated dataset.
+ 
+```{r, warning=F, message=F}
+ps4 <- transform_sample_counts(ps3, function(x) x / sum(x))
+```
+
+### Subset phyloseq object for data to be analyzed.
+
+```{r, warning=F, message=F, results='hide'}
+ps4.NICU_no_na <- subset_samples(ps4, 
+              Primary_Group == "NICU" & 
+              (Type == "Admission" | Type == "Discharge"))
+```
+
+ - Explore normalisation with tree plots.
+ 
+```{r, warning=F, message=F, fig.cap="Tree plot exploring the normalised distribution of taxa between admission and discharge samples."}
+plot_tree(ps4.NICU_no_na, size = "Abundance", color = "Type", 
+    justify = "yes please", ladderize = "left") +
+    labs(title = "Phylogenetic Tree and Relative Abundance") +
+    scale_size_continuous(range = c(.5, 3))
+```
+
+ - Explore normalisation with violin plots.
+ - Compares differences in scale and distribution of the abundance values before and after transformation.
+ - Using arbitrary subset, based on Phylum = Firmicutes, for plotting (ie. can explore any taxa to observe transformation).
+ 
+```{r, warning=F, message=F, fig.cap="Violin plots exploring of distribution of abundance in Firmicutes before and after normalisation of data. Annotation for x axis; A: Admission, D: Discharge & I: Intermediate."}
+plot_abundance = function(physeq, Title = "Abundance", Facet = "Order", Color = "Phylum"){
+    subset_taxa(physeq, Phylum %in% c("Firmicutes")) %>%
+    psmelt() %>%
+    subset(Abundance > 0) %>%
+    ggplot(mapping = aes_string(x = "Type", y = "Abundance", color = Color, fill = Color)) +
+      geom_violin(fill = NA) +
+      geom_point(size = 1, alpha = 0.3, position = position_jitter(width = 0.3)) +
+      facet_wrap(facets = Facet) + 
+      scale_y_log10()+
+      scale_x_discrete(labels = c("A", "D", "I", "NA")) +
+      theme(legend.position="none") +
+      labs(title = Title)
+}
+
+grid.arrange(nrow = 2, (plot_abundance(ps3, Title = "Abundance", Color = "Type")),
+             plot_abundance(ps4, Title = "Relative Abundance", Color = "Type"))
+```
+
+# Data Exploration and Univariate Analysis.
+
+## About.
+This section again uses the [phyloseq](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0061217) package (along with several others) to explore the data using bar, violin and ordination plot. This then leads into a collection of univariate analyses, including; alpha and beta diversity, and also taxonomic differential abundance.
+
+## Load required packages. 
+
+```{r, warning=F, message=F, results='hide'}
+sapply(c("BiocManager", "ggplot2", "ggforce", "vegan", "knitr", "dplyr", 
+         "phyloseq", "phyloseqGraphTest", "igraph", "ggnetwork", "nlme", 
+         "reshape2", "tidyverse", "plyr", "DESeq2", "sjPlot", "ggpubr", 
+         "gridExtra", "grid", "gtable", "lazyeval"), require, character.only = TRUE)
+```
+
+## Taxanomic distribution.
+
+### Violin plots.
+ - Use previously defined violin plots to explore distributions of taxa.
+ - If a bimodal distribution is observed we can subset the data to determine if there is a taxonomic explination.
+ - Considerations: arguments can be altered for exploration.
+ 
+```{r, warning=F, message=F, fig.cap="Violin plots exploring of distribution of abundances within Lactoacillales. Annotation for x axis; A: Admission, D: Discharge & I: Intermediate."}
+subset_taxa(ps4, Order == "Lactobacillales") %>%
+plot_abundance(Facet = "Genus", Color = "Type")
+```
+
+### Bar charts
+ - Use `plot_bar_auto()` function wrapped around phyloseq's `plot_bar()` to explore the distribution of taxa at the genus and phylum levels.
+ - Subset transformed data (relative abundance) to only the top20 taxa.
+ 
+```{r, warning=F, message=F, fig.cap="Bar plots of the taxonomic distribution (relative abundance) at phylum and genus levels.", results='hide'}
+top20 <- names(sort(taxa_sums(ps4.NICU_no_na), decreasing=TRUE))[1:20]
+ps.top20 <- prune_taxa(top20, ps4.NICU_no_na)
+
+plot_bar_auto <- function(ps, taxonomy){
+plot_bar(ps, fill = taxonomy) + 
+    facet_wrap(~Type, scales = "free_x") + 
+    labs(title = paste0("Level:", taxonomy), y = "Abundance") + 
+    theme(legend.position = "bottom", legend.title = element_blank(), 
+    axis.title.x = element_blank(), axis.text.x = element_blank(), 
+    axis.ticks = element_blank())
+}
+
+grid.arrange(plot_bar_auto(ps.top20, "Phylum"), 
+             plot_bar_auto(ps.top20, "Genus"), 
+             nrow = 2, heights = c (1,1.2))
+```
+
+ - For other levels of taxonomy, with the legend hiden using `legend.position = "none"`.
+ 
+```{r, warning=F, message=F, fig.cap="Bar plots of the taxonomic distribution (relative abundance) at class, order and family levels."}
+plot_bar_auto_no_legend <- function(ps, taxonomy){
+plot_bar(ps, fill = taxonomy) + 
+    facet_wrap(~Type, scales = "free_x") + 
+    labs(title = paste0("Level:", taxonomy), y = "Abundance") + 
+    theme(legend.position = "none", legend.title = element_blank(), 
+    axis.title.x = element_blank(), axis.text.x = element_blank(), 
+    axis.ticks = element_blank())
+}
+
+grid.arrange(plot_bar_auto_no_legend(ps.top20, "Class"), 
+             plot_bar_auto_no_legend(ps.top20, "Order"), 
+             plot_bar_auto_no_legend(ps.top20, "Family"),
+             nrow = 3)
+```
+
+### Calculate the number samples containing a given taxa `samples_with_taxa()` function.
+
+ - The function takes the phyloseq object, taxonomy level and taxanomic name (with the later two as strings). 
+ - It then gets the ASV name from the *phyloseq* `tax_table()` by filtering with *dply* and [*lazyeval*](https://cran.r-project.org/web/packages/lazyeval/index.html). ( *lazyeval* is needed because of two concepts;[non-standard evaluation](http://adv-r.had.co.nz/Computing-on-the-language.html) and [lazy evaluation](http://adv-r.had.co.nz/Functions.html#function-arguments).
+ - `paste()` is then used to concatenate the ASVs and `collapse` to insert the 'or' symbol.
+ - The function then matches the ASV names to the `otu_table()` of the *phyloseq* object to select the desired column(s) that represent the taxa of interest, and then counts the number of rows that have any of the selected taxa with counts greater than 0 to get the number of samples with that taxa present.
+ 
+```{r, warning=F, message=F}
+samples_with_taxa <- function(ps_object, taxonomy_level, taxa){
+ ASV <- tax_table(ps_object) %>% 
+        unclass() %>% 
+        as.data.frame() %>% 
+        filter_(interp(~y == x, .values=list(y = as.name(taxonomy_level), x = taxa))) %>%
+        row.names() %>%
+        paste(collapse = " | ")
+  
+   otu_table(ps_object) %>% 
+        as.data.frame() %>% 
+        select(matches(ASV)) %>% 
+        filter_all(any_vars( . > 0)) %>%  
+        nrow()
+}
+
+samples_with_taxa(ps4.NICU_no_na, "Genus", "Bifidobacterium")
+```
+
+## Beta diversity
+ - Use distance and ordination methods to explore the relationship between metadata.
+ - We calculate the distances using pruned, transformed and non-agglomerated data.
+
+```{r, warning=F, message=F}
+ps2.NICU_no_na <- subset_samples(ps2, Primary_Group == "NICU" & 
+        (Type == "Admission" | Type == "Discharge")) %>%
+        transform_sample_counts(function(x) x / sum(x))
+```
+ 
+ - We can then create distance matrices and plots for this data subset using several methods:
+  - bray-curtis or weighted unifrac distances with principle coordinate analysis (PCoA).
+    - weighted-unifrac: phylogeny.
+    - bray-curtis: abundance and phylogeny.
+ - Ordinate using PCoA and Weighted-Unifrac/Bray-Curtis.
+ - Extract eigenvalues from ordination.
+ - Plot ordination using eigenvalues and colour by variable *Type*.
+    
+### PCoA and Bray-Curtis.
+
+```{r, fig.cap="PCoA plot of Bray-Curtis matrix", warning=F, message=F}
+ps_ordination <- ordinate(ps2.NICU_no_na, method = "PCoA", distance = "bray")
+
+evals <- ps_ordination$values$Eigenvalues
+
+plot_ordination(ps2.NICU_no_na , ps_ordination, color = "Type", 
+  title = "PCoA (Bray-Curtis)") +
+  labs(col = "Type") +
+  coord_fixed(sqrt(evals[2] / evals[1])) +
+  geom_point(size = 2)+
+  stat_ellipse(type = "norm", linetype = 2)
+```
+
+### PCoA and Weighted-Unifrac.
+
+```{r, fig.cap="PCoA plot of Weighted-Unifrac matrix", warning=F, message=F}
+ps_ordination <- ordinate(ps2.NICU_no_na, method = "PCoA", distance = "wunifrac")
+
+evals <- ps_ordination$values$Eigenvalues
+
+plot_ordination(ps2.NICU_no_na , ps_ordination, color = "Type", 
+  title = "PCoA (Weighted-Unifrac)") +
+  labs(col = "Type") +
+  coord_fixed(sqrt(evals[2] / evals[1])) +
+  geom_point(size = 2)+
+  stat_ellipse(type = "norm", linetype = 2)
+```
+
+ - Export plots.
+ 
+```{r, eval=F}
+ggsave("PCoA_Weighted-Unifrac.png", 
+  plot = (plot_ordination(ps2.NICU_no_na , ps_ordination, 
+  color = "Type", title = "PCoA (Weighted-Unifrac)") +
+  labs(col = "Type") +
+  coord_fixed(sqrt(evals[2] / evals[1])) +
+  geom_point(size = 2)+
+  stat_ellipse(type = "norm", linetype = 2)), dpi = 600, height = 5, width = 5)
+```
+
+### Statistical test: PERMANOVA.
+ - Preforming permutational anova for group-level (*Type* of sample) differences based on dissimilarity.
+ - Extract otu table and metadata from phyloseq object.
+ - Use `adonis()` from the *vegan* package to perform the PERMANOVA.
+ 
+```{r, warning=F, message=F}
+ps_otu <- data.frame(otu_table(ps2.NICU_no_na))
+ps_samp <- data.frame(sample_data(ps2.NICU_no_na))
+
+permanova <- adonis(ps_otu ~Type, data = ps_samp, method = "bray")
+as.data.frame(permanova$aov.tab)
+```
+
+ - Significant PERMANOVA means one of three things:
+  - there is a difference in the location of the samples (i.e. the average community composition).
+  - there is a difference in the dispersion of the samples (i.e. the variability in the community composition).
+  - there is a difference in both the location and the dispersion.
+ - If you get a significant PERMANOVA you'll want to distinguish between the three options by checking the homogeneity condition using `permdisp()`. If you get a non-significant result the first option above is correct.
+ 
+```{r, warning=F, message=F}
+dist <- vegdist(ps_otu)
+as.data.frame(anova(betadisper(dist, ps_samp$Type)))
+```
+ 
+ - `betadisper()` gives a measure of the dispersion within groups. Thus, if the PERMANOVA test is significant and the permdisp is not, the significant result in your communities is due to a mean shift in community composition and not from increased variance within groups.
+ 
+ - Export results.
+ 
+```{r, eval=F}
+tab_df((as.data.frame(permanova$aov.tab)), 
+       alternate.rows = TRUE, 
+       title = "PERMANOVA: Admission vs Discharge", 
+       file = "PERMANOVA_ADvsDIS.doc")
+
+tab_df((as.data.frame(anova(betadisper(dist, ps_samp$Type)))), 
+       alternate.rows = TRUE, 
+       title = "Homogeneity (PERMANOVA): Admission vs Discharge", 
+       file = "Homogeneity_PERMANOVA_ADvsDIS.doc")
+```
+
+ - Explore the major contributors to the differences.
+
+```{r, warning=F, message=F}
+coef <- coefficients(permanova)["Type1",]
+top.coef <- coef[rev(order(abs(coef)))[1:20]]
+
+major_contributors <- tax_table(ps2.NICU_no_na) %>% 
+    unclass() %>% 
+    as.data.frame() %>% 
+    select("Genus", "Species") %>% 
+    rownames_to_column(var = "ASV") %>% 
+    right_join((as.data.frame(top.coef) %>%
+    rownames_to_column(var = "ASV"))) %>% 
+    select(!"ASV") 
+```
+
+ - Export table.
+ 
+```{r, eval=F}
+tab_df(major_contributors , alternate.rows = TRUE, 
+       title = "Major Contriutors to PERMANOVA differences.", 
+       file = "Major_contributors_beta_diversity.doc")
+```
+
+
+## Alpha Diversity.
+ - Subset ps2 to exclude SCN and NA values.
+ - Estimate richness and save as object.
+ - Remove chao1 standard error column and "X" from row names.
+ - Create a new variable column with rownames.
+ - Merge alpha diversity estimates (*ps_alpha_div*) with the metadata (*samdf*) by the *Label* column (orignially row names), for downstream analysis.
+ 
+```{r, warning=F, message=F}
+ps.NICU_no_na <- subset_samples(ps2, 
+              Primary_Group == "NICU" & 
+              (Type == "Admission" | Type == "Discharge"))
+
+ps_alpha_div <- ps.NICU_no_na %>%
+              estimate_richness(measures = c("Shannon", "Observed", "Chao1")) %>%
+              subset(select =  -se.chao1)
+
+rownames(ps_alpha_div) <- sub("X", "", rownames(ps_alpha_div))
+
+ps_alpha_div$Label <- rownames(ps_alpha_div) %>%
+              as.factor()
+
+ps_samp <- samdf %>%
+              filter(Primary_Group == "NICU" & 
+              (Type == "Admission" | Type == "Discharge")) %>% 
+              right_join(ps_alpha_div, by = "Label") %>%
+              as.data.frame()
+```
+
+ - Create histogram to examine distribution.
+ 
+```{r, warning=F, message=F}
+# To determine if diveristy is normally distributed
+ggplot(ps_samp, aes(x = Shannon)) + geom_histogram() + 
+       xlab("Alpha Diversity") + ylab("Count")
+```
+
+ - Test for normality.
+ 
+```{r, warning=F, message=F}
+shapiro.test(ps_samp$Shannon)
+```
+ 
+ ### Statistical test: compare mean/median bteween admission and discharge samples.
+ 
+ - Combine the outputs.
+ 
+```{r, warning=F, message=F}
+Shannon <- compare_means(Shannon ~ Type, data = ps_samp, 
+                         method = "wilcox.test", p.adjust.method = "fdr")
+Observed <- compare_means(Observed ~ Type, data = ps_samp, 
+                          method = "wilcox.test", p.adjust.method = "fdr")
+Chao1 <- compare_means(Chao1 ~ Type, data = ps_samp, 
+                       method = "wilcox.test", p.adjust.method = "fdr")
+
+Diversity_Analysis <- bind_rows(Shannon, Observed, Chao1) %>%
+  rename(c(".y." = "Diversity Measure"))
+
+Diversity_Analysis
+```
+
+ - Export *Diversity_Analysis* results table.
+ 
+```{r, eval=F}
+tab_df(Diversity_Analysis, alternate.rows = TRUE, 
+       title = "Diversity Analysis: Admission Vs Discharge", 
+       file = "Alpha_Diversity_Analysis_Type.doc")
+```
+
+### Plot alpha diversity.
+
+ - Use `plot_richness()` from *phyloseq*, which estimates alpha diversity metrics using *vegan* and plots them, taking standard *ggplot2* *geoms_* for the plot design.
+ 
+```{r, warning=F, message=F, fig.cap="Scatterplot of richness and shannon diversity metrics coloured by the type of sample."}
+plot_richness(ps.NICU_no_na, measures = c("Shannon", "Observed"), 
+              color = "Type", title = "") +
+    geom_point(size = 3.5, alpha = 0.7) +
+    theme(axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), 
+          panel.border = element_rect(colour = "grey", fill = NA, size = 1))
+```
+
+ - Export scatterplot.
+ 
+```{r, eval=F}
+ggsave("Alpha_Point.png", dpi = 600, height = 5, width = 5)
+```
+
+ - Use `plot_richness()` to create boxplots of alpha diversity.
+ - To add a layer with p values use `stat_compare_means(comparisons = list(c("Admission", "Discharge")), method = "wilcox.test")`.
+ 
+```{r, warning=F, message=F, fig.cap="Boxplots of richness and shannon diversity metrics coloured by the type of sample."}
+plot_richness(ps.NICU_no_na, measures = c("Shannon", "Observed"), 
+              x = "Type", color = "Type", title = "") +
+    geom_point(size = 1, alpha = 0.7) +
+    geom_boxplot() +
+    theme(panel.border = element_rect(colour = "grey", fill = NA, size = 1)) 
+```
+
+ - Export boxplot.
+ 
+```{r, eval=F}
+ggsave("Alpha_Box.png", dpi = 600, height = 5, width = 5)
+```
+
+ - Explore the distribution of alpha diversity across the two groups using a histogram.
+ - Calculate mean and medians for shannon diversity to be used for dotted lines in histogram.
+
+```{r, warning=F, message=F, fig.cap="Histogram showing the distribution of the shannon index scores across samples, coloured by sample type and with lines representing the mean (dashed) and median (solid)."}
+div_med <- ddply(ps_samp, "Type", summarise, grp.med = median(Shannon))
+div_mean <- ddply(ps_samp, "Type", summarise, grp.mean = mean(Shannon))
+
+ggplot(ps_samp, aes(x = Shannon, color = Type)) + 
+  geom_histogram(alpha = 0.25, position="dodge") + 
+  labs(title = "", x = "Shannon Index", y = "Sample count") +
+  geom_vline(data = div_mean, aes(xintercept = grp.mean, color = Type), 
+             linetype = "dashed") +
+  geom_vline(data = div_med, aes(xintercept = grp.med, color = Type), 
+             linetype = "solid") +
+  theme(panel.border = element_rect(colour = "grey", fill = NA, size = 1))
+```
+
+ - The admission outliers in red may explain why were not seeing the significant differences in diversity.
+
+ - Export histogram.
+ 
+```{r, eval=F}
+ggsave("Alpha_Distribution.png", dpi = 600, height = 5, width = 10)
+```
+
+
+## Taxonomic abundance with [*DESeq2*](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-014-0550-8).
+ - Subset to filtered/agglomerated data.
+ - Convert from *phyloseq* to *deseq* object.
+ - To perform analysis at other levels of taxonomy use `tax_glom(ps2, "Phylum", NArm = TRUE)` prior to running the chunk below.
+ 
+```{r, warning=F, message=F}
+ps.NICU <- subset_samples(ps3, Primary_Group == "NICU" & 
+        (Type == "Admission" | Type == "Discharge")) 
+
+ps.NICU.deseq = phyloseq_to_deseq2(ps.NICU, ~Type)
+```
+
+ - Define function for calculating geometric means.
+ - Calculate geometric means, and subsetuently estimate size factors.
+ 
+```{r, warning=F, message=F}
+gm_mean = function(x, na.rm = TRUE){
+  exp(sum(log(x[x > 0]), na.rm = na.rm) / length(x))
+}
+
+geoMeans <- apply(counts(ps.NICU.deseq), 1, gm_mean)
+
+ps.NICU.deseq <- estimateSizeFactors(ps.NICU.deseq, geoMeans = geoMeans) 
+```
+
+ - Construct histograms to compare pre and post transformation.
+ - Call `estimateDispersions()` to calculate abundances with `getVarianceStabilizedData()`.
+ - **NB.** the samples are in columns in the *deseq* object but in rows for the *phyloseq* object.
+ - Axis adujsted for what best represents the distribution.
+ 
+```{r, warning=F, message=F, fig.cap="Pre and post transformation of taxonomic counts with DESeq2"}
+ps.NICU.deseq <- estimateDispersions(ps.NICU.deseq, fitType = "local")  
+
+abund_sums_trans <- data.frame(sum = colSums(getVarianceStabilizedData(ps.NICU.deseq) ), 
+                     sample = colnames(getVarianceStabilizedData(ps.NICU.deseq) ), 
+                     type = "DESeq2")
+
+abund_sums_no_trans <- data.frame(sum = rowSums(otu_table(ps.NICU)), 
+                       sample = rownames(otu_table(ps.NICU)), 
+                       type = "None")
+
+grid.arrange((ggplot(abund_sums_trans) +
+  geom_histogram(aes(x = sum), binwidth = 1) +
+  xlab("Abundance within sample") +
+  xlim(NA, 300) +
+  ylim(0,6) +
+  ggtitle("DESeq2 transformation")),
+  (ggplot(abund_sums_no_trans) +
+  geom_histogram(aes(x = sum), binwidth = 200) +
+  xlab("Abundance within sample") +
+  ylim(0,5) +
+  ggtitle("No transformation")),
+  nrow = 2)
+```
+
+### Statisical test: calculate differential abundances with *DESeq2*.
+
+ - Use `DESeq()` to perform differential expression analysis based on the negative binomial distribution.
+ - The function estimates size factors, estimates dispersion, fits a negative binomial GLM and performs a Wald test.
+ - Extract the results, order by p value, select only significant (<0.05) results, bind this data to the *tax_table* from the *phyloseq* object to get the taxonomic information, and then select and order the desired columns.
+ 
+```{r, warning=F, message=F}
+ps.NICU.deseq = DESeq(ps.NICU.deseq, fitType = "local")
+res = results(ps.NICU.deseq, contrast = c("Type", "Discharge", "Admission"))
+res = res[order(res$padj, na.last = NA), ]
+alpha = 0.05
+sigtab = res[(res$padj < alpha), ] 
+sigtab = cbind(as(sigtab, "data.frame"), 
+         as(tax_table(ps.NICU)[rownames(sigtab), ], "matrix"))
+
+sigtab %>%
+  select("baseMean", "log2FoldChange", "lfcSE", "padj", 
+  "Phylum", "Class", "Order", "Family", "Genus") %>%
+  remove_rownames() 
+```
+
+ - Export results.
+ 
+```{r, eval=F}
+tab_df(posigtab, alternate.rows = TRUE, 
+       title = "Differential Abundance of Genera: Admission Vs Discharge", 
+       file = "Diff_Abundance_Genera.doc")
+```
+
+## Summary.
+
+ - Create a summary grid including alpha and beta diversity metrics, as well as differential abundance testing results.
+ 
+```{r, warning=F, message=F, eval=F}
+#PCoA Plot
+ps_ordination <- ordinate(ps2.NICU_no_na , method = "PCoA", distance ="bray")
+
+evals <- ps_ordination$values$Eigenvalues
+
+PCoA_plot <- plot_ordination(ps2.NICU_no_na, ps_ordination, color = "Type") +
+             coord_fixed(sqrt(evals[2] / evals[1])) +
+             labs(col = "Type", title = "PCoA (Bray-Curtis)") +
+             geom_point(size = 2) +
+             stat_ellipse(type = "norm", linetype = 2) 
+  
+PCoA_plot <- annotate_figure(PCoA_plot, fig.lab = "A", 
+                             fig.lab.face = "bold", fig.lab.size = 20)
+
+# Alpha Diversity Plot
+alpha_plot <- plot_richness(ps.NICU_no_na, measures = c("Shannon", "Observed"), 
+              x = "Type", color = "Type", title = "Alpha Diversity") +
+              geom_point(size = 1, alpha = 0.7) +
+              geom_boxplot() +
+              theme(panel.border = element_rect(colour = "grey", fill = NA, size = 1), 
+              legend.position = "none", axis.text.y=element_blank())
+
+alpha_plot <- annotate_figure(alpha_plot, fig.lab = "B", 
+                              fig.lab.face = "bold", fig.lab.size = 20)
+
+# Differenital Abundance
+title <- textGrob("Differential Abundance", gp = gpar(fontsize = 15))
+
+padding <- unit(5,"mm")
+
+genus_df <- as.data.frame(sigtab) %>%
+            mutate(across(where(is.numeric), round, 2)) %>%
+            remove_rownames() %>%
+            add_column("p-adj" = "<0.01") %>%
+            select("Genus","p-adj", "log2FoldChange","lfcSE") %>%
+            dplyr::rename("lfc" = log2FoldChange) %>%
+            tableGrob(rows = NULL) %>%
+            gtable_add_rows(heights = grobHeight(title) + padding, pos = 0) %>%
+            gtable_add_grob(title, 1, 1, 1, 4)
+
+genus_df <- annotate_figure(genus_df, fig.lab = "C", 
+                            fig.lab.face = "bold", fig.lab.size = 15)
+
+# grid layout
+lay <- rbind(c(1,2), 
+             c(3,2))
+
+grid.arrange(PCoA_plot, alpha_plot, genus_df, nrow = 2, layout_matrix = lay)
+```
+
+# Multivariant Analysis.
+
+## About.
+
+This section is for exploring the impact of several variables on alpha diversity and taxonomic abundances.
+
+## Mixed effects modelling with [*DESeq2*](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-014-0550-8) for differential abundance testing.
+
+ - This analysis is creating two seperate models to explore potential associations between clinical variables and  microbiome taxonomy.
+ - The variables were selected for the model using a combination of exploratory analysis (not detailed here) and the literature.
+ - The first part of the workflow details the steps for the analysis on the *Admission* model, and there is a seperate chunk with the entire analysis for the *Discharge* model.
+ -  The significant results from the two models are combined at the end.
+
+```{r, warning=F, message=F, results='hide'}
+sapply(c("DESeq2", "phyloseq", "dplyr", "ggplot2", "grid", 
+         "gridExtra", "ggpubr", "sjPlot", "pheatmap", "tidyverse"), 
+          require, character.only = TRUE)
+```
+
+### Subset data.
+
+ - Subset to filtered/agglomerated *Admission* data and scale continuous variables.
+ 
+```{r, warning=F, message=F}
+ps.NICU <- subset_samples(ps3, Primary_Group == "NICU" & 
+        Type == "Admission")
+
+sample_data(ps.NICU)$Gestation_Days_scaled <- scale(sample_data(ps.NICU)$Gestational.Age.at.Birth, 
+                    center = TRUE, scale = 2*sd(sample_data(ps.NICU)$Gestational.Age.at.Birth))
+
+sample_data(ps.NICU)$Birth.Weight_scaled <- scale(sample_data(ps.NICU)$Birth.Weight, 
+                    center = TRUE, scale = 2*sd(sample_data(ps.NICU)$Birth.Weight))
+```
+
+#### Testing for multicollinearity.
+ - Define the `corvif()`function that takes metadata and creates a linear model to see if any collinearity exists between variables.
+ - Then use this function on a defined a vector with all the variables to be included in the model.
+ - If GVIF < 3 = no collinearity.
+ 
+```{r, eval=F}
+corvif <- function(data) {
+  data <- as.data.frame(data)
+
+  form    <- formula(paste("fooy ~ ",paste(strsplit(names(data)," "),collapse = " + ")))
+  data  <- data.frame(fooy = 1 + rnorm(nrow(data)) ,data)
+  lm_mod  <- lm(form,data) # runs linear model with above formula and metadata
+  
+  cat("\n\nVariance inflation factors\n\n")
+  print(myvif(lm_mod))
+}
+
+model_data <- sample_data(ps.NICU) %>%
+  unclass() %>%
+  as.data.frame() 
+
+model_data <- cbind(model_data$Mode.of.Delivery, model_data$Feeding.Type, 
+                    model_data$Gestation_Days_scaled, model_data$NEC, 
+                    model_data$Sepsis, model_data$Chorioamnionitis, 
+                    model_data$Preeclampsia, model_data$ROP)
+
+corvif(model_data)
+```
+
+ - Convert from *phyloseq* to *deseq* object.
+ 
+```{r, warning=F, message=F}
+multi.deseq = phyloseq_to_deseq2(ps.NICU, ~Sepsis + Feeding.Type + 
+                                   Chorioamnionitis + Mode.of.Delivery + 
+                                   Gestation_Days_scaled  + NEC + 
+                                   Preeclampsia + ROP)
+```
+
+ - Define function for calculating geometric means.
+ - Calculate geometric means, and subsetuently estimate size factors.
+ - Subset out taxa with small counts and low occurance (at least 10 in  20 or more samples).
+ 
+```{r, warning=F, message=F}
+gm_mean = function(x, na.rm = TRUE){
+  exp(sum(log(x[x > 0]), na.rm = na.rm) / length(x))
+}
+
+geoMeans <- apply(counts(multi.deseq), 1, gm_mean)
+multi.deseq <- estimateSizeFactors(multi.deseq, geoMeans = geoMeans) 
+
+nc <- counts(multi.deseq, normalized = TRUE)
+filtered <- rowSums(nc >= 10) >= 20
+multi.deseq <- multi.deseq[filtered,]
+```
+
+ - Construct histograms to compare pre and post transformation.
+ - Call `estimateDispersions()` to calculate abundances with `getVarianceStabilizedData()`.
+ - **NB.** the samples are in columns in the *deseq* object but in rows for the *phyloseq* object.
+ - Axis adujsted for what best represents the distribution.
+ 
+```{r, warning=F, message=F, fig.cap="Pre and post transformation of taxonomic counts with DESeq2"}
+multi.deseq <- estimateDispersions(multi.deseq, fitType = "local")  
+
+abund_sums_trans <- data.frame(sum = colSums(getVarianceStabilizedData(multi.deseq) ), 
+                     sample = colnames(getVarianceStabilizedData(multi.deseq) ), 
+                     type = "DESeq2")
+
+abund_sums_no_trans <- data.frame(sum = rowSums(otu_table(ps.NICU)), 
+                       sample = rownames(otu_table(ps.NICU)), 
+                       type = "None")
+
+grid.arrange((ggplot(abund_sums_trans) +
+  geom_histogram(aes(x = sum), binwidth = 1) +
+  xlab("Abundance within sample") +
+  xlim(NA, 200) +
+  ylim(0,6) +
+  ggtitle("DESeq2 transformation")),
+  (ggplot(abund_sums_no_trans) +
+  geom_histogram(aes(x = sum), binwidth = 200) +
+  xlab("Abundance within sample") +
+  ylim(0,5) +
+  ggtitle("No transformation")),
+  nrow = 2)
+```
+
+### Statisical test: calculate differential abundances with *DESeq2*.
+ - Use `Deseq()` to perform the normalisation and analysis.
+ - Omit non-converging rows.
+ 
+```{r, warning=F, message=F}
+multi.deseq = DESeq(multi.deseq, fitType = "local", test = "Wald")
+
+multi.deseq.clean <- multi.deseq[which(mcols(multi.deseq)$betaConv),] 
+```
+
+ - Define a function to extract the results.
+ - Extract the results, order by p value, selects significant (<0.05) results, binds this data to the *tax_table* from the *phyloseq* object to get the taxonomic information, and then select and order the desired columns.
+ 
+```{r, warning=F, message=F}
+get_deseq_res <- function(desq_object, contrast_variable, level1, level2){
+  res = results(desq_object, contrast = c(contrast_variable, level1, level2))
+  res = res[order(res$padj, na.last = NA), ]
+  alpha = 0.05
+  sigtab = res[(res$padj < alpha), ] 
+  sigtab = cbind(as(sigtab, "data.frame"), 
+          as(tax_table(ps.NICU)[rownames(sigtab), ], "matrix"))
+  sigtab %>%
+  arrange(log2FoldChange) %>%
+  select("log2FoldChange", "lfcSE", "padj", "Genus") %>%
+  add_column(Variable = paste0(contrast_variable, ":Yes"))
+}
+```
+
+ - Use the `get_deseq_res()` to create a table of each of the significant variables.
+ 
+```{r, eval=F}
+sigtab_admission <- bind_rows(get_deseq_res(multi.deseq.clean, 
+                              "Chorioamnionitis", "Yes", "No"),
+                              get_deseq_res(multi.deseq.clean, 
+                              "Sepsis", "Yes", "No"),
+                              get_deseq_res(multi.deseq.clean, 
+                              "NEC", "Yes", "No"),
+                              get_deseq_res(multi.deseq.clean, 
+                              "ROP", "Yes", "No")) %>%
+                    add_column(Sample = "Admission")
+```
+
+ - Create a *Discharge* model.
+ 
+```{r, warning=F, message=F}
+ps.NICU <- subset_samples(ps3, Primary_Group == "NICU" & 
+        Type == "Discharge")
+
+sample_data(ps.NICU)$Gestation_Days_scaled <- scale(sample_data(ps.NICU)$Gestational.Age.at.Birth, 
+                    center = TRUE, scale = 2*sd(sample_data(ps.NICU)$Gestational.Age.at.Birth))
+
+sample_data(ps.NICU)$Birth.Weight_scaled <- scale(sample_data(ps.NICU)$Birth.Weight, 
+                    center = TRUE, scale = 2*sd(sample_data(ps.NICU)$Birth.Weight))
+
+multi.deseq = phyloseq_to_deseq2(ps.NICU, ~Sepsis + Feeding.Type + Chorioamnionitis + 
+                                   Mode.of.Delivery + Gestation_Days_scaled  + NEC + 
+                                   Preeclampsia + ROP)
+
+geoMeans <- apply(counts(multi.deseq), 1, gm_mean)
+multi.deseq <- estimateSizeFactors(multi.deseq, geoMeans = geoMeans) 
+
+nc <- counts(multi.deseq, normalized = TRUE)
+filtered <- rowSums(nc >= 10) >= 20
+multi.deseq <- multi.deseq[filtered,]
+
+multi.deseq = DESeq(multi.deseq, fitType = "local", test = "Wald")
+multi.deseq.clean <- multi.deseq[which(mcols(multi.deseq)$betaConv),] 
+
+sigtab_discharge <- bind_rows(get_deseq_res(multi.deseq.clean, 
+                              "Chorioamnionitis", "Yes", "No"),
+                              get_deseq_res(multi.deseq.clean, 
+                              "Preeclampsia", "Yes", "No"),
+                              get_deseq_res(multi.deseq.clean, 
+                              "Feeding.Type", "Formula", "Breastmilk")) %>%
+                    add_column(Sample = "Discharge")
+```
+
+ - Merge *Admission* and *Discharge* outputs.
+ 
+```{r,eval=F}
+DESeq2_Summary_Table <- bind_rows(sigtab_admission, sigtab_discharge)
+```
+
+ - Export combined table.
+ 
+```{r, eval=F}
+tab_df(DESeq2_Summary_Table, alternate.rows = TRUE, 
+       title = "Differentially Abundant Taxa", 
+       file = "Differentially_Abundant_Taxa_Summary.doc")
+```
+
+### Visualisations for *deseq* modelling.
+
+ - Visualising deseq-transformed abundances with heat maps.
+ 
+```{r, warning=F, message=F, eval=F}
+multi.deseq.clean %>%
+  varianceStabilizingTransformation() %>%
+  assay() %>%
+  cor() %>%
+  pheatmap()
+```
+
+ - Visualising deseq-transformed abundances with PCA (substitute in any variable).
+ 
+```{r, warning=F, message=F, eval=F}
+multi.deseq.clean %>%
+  varianceStabilizingTransformation() %>% 
+  plotPCA(intgroup = "Mode.of.Delivery") +
+   xlim(-20,20)+
+   ylim(-20,20)
+```
+
+ - Plot counts for comparisons (takes ASV).
+ 
+```{r, eval=F}
+ggplot((plotCounts(multi.deseq.clean,  "GTGGGGAATATTGCACAATGGGCGCAAGCCTGATGCAGCCATGCCGCGTGTATGAAGAAGGCCTTCGGGTTGTAAAGTACTTTCAGCGGGGAGGAAGGGAGTAAAGTTAATACCTTTGCTCATTGACGTTACCCGCAGAAGAAGCACCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCACGCAGGCGGTTTGTTAAGTCAGATGTGAAATCCCCGGGCTCAACCTGGGAACTGCATCTGATACTGGCAAGCTTGAGTCTCGTAGAGGGGGGTAGAATTCCAGGTGTAGCGGTGAAATGCGTAGAGATCTGGAGGAATACCGGTGGCGAAGGCGGCCCCCTGGACGAAGACTGACGCTCAGGTGCGAAAGCGTGGGGAGCAAACA", 
+      intgroup = "Preeclampsia", returnData = TRUE)), 
+      aes(x = Preeclampsia, y = count)) +
+  geom_point()+
+  scale_y_log10() +
+  labs(title = "SEscherichia/Shigella", x = "", y = "")
+```
+
+
+## Mixed effects modelling with [lme4](https://cran.r-project.org/web/packages/lme4/vignettes/lmer.pdf) for Shannon Diversity.
+ 
+ - This analysis is exploring the impact of several clinical variables on alpha diversity using a backwards selection method that allows determination of the least complex adequate model.
+
+```{r, warning=F, message=F, results='hide'}
+sapply(c("lme4", "nlme", "dplyr", "plyr", "lmerTest", "aods3", 
+         "tidyr", "ggplot2", "MuMIn", "sjPlot", "gridExtra", 
+         "grid", "car", "emmeans", "ggpubr"), 
+         require, character.only = TRUE)
+```
+
+### Subset data.
+
+ - As done previously, subset ps to exclude SCN and NA values.
+ - Scale continuous variables.
+ - Estimate richness and save as object.
+ - create a new variable column with rownames.
+ - merge alpha diversity estimates (*ps_alpha_div*) with the metadata (*samdf*) by the *Label* column (orignially row names), for downstream analysis.
+ 
+```{r, warning=F, message=F}
+ps.NICU <- subset_samples(ps, 
+                 Primary_Group == "NICU" & 
+                 (Type == "Admission" | Type == "Discharge")) 
+
+sample_data(ps.NICU)$Gestation_Days_scaled <- scale(sample_data(ps.NICU)$Gestational.Age.at.Birth, 
+            center = TRUE, scale = 2*sd(sample_data(ps.NICU)$Gestational.Age.at.Birth))
+
+sample_data(ps.NICU)$Birth.Weight_scaled <- scale(sample_data(ps.NICU)$Birth.Weight, 
+            center = TRUE, scale = 2*sd(sample_data(ps.NICU)$Birth.Weight))
+
+ps_alpha_div <- ps.NICU %>%
+                estimate_richness(measures = c("Shannon")) %>%
+                add_column(Label = row.names(sample_data(ps.NICU))) 
+
+ps_samp <- sample_data(ps.NICU) %>%
+  unclass() %>%
+  data.frame() %>%
+  left_join(ps_alpha_div, by = "Label")
+```
+
+### Testing for multicollinearity.
+ - Use previously defined `corvif()` function that takes metadata and creates a linear model to see if any collinearity exists between variables.
+ - Use this function on a defined a vector with all the variables to be included in the model.
+ - If GVIF < 3 = no collinearity.
+ 
+```{r, eval=F}
+variables <- cbind(ps_samp$Mode.of.Delivery, ps_samp$Feeding.Type, 
+                   ps_samp$Gestation_Days_scaled, ps_samp$Birth.Weight_scaled, 
+                   ps_samp$Antenatal.Antibiotics, ps_samp$Antenatal..Infections, 
+                   ps_samp$NEC, ps_samp$Sepsis, ps_samp$Chorioamnionitis, 
+                   ps_samp$Neonatal.Antibiotics, ps_samp$Died, 
+                   ps_samp$Prolonged..Membrane..Rupture, ps_samp$Preeclampsia, 
+                   ps_samp$Diabetes, ps_samp$ROP, ps_samp$Type)
+
+corvif(variables)
+```
+
+### Fit Model.
+ - Fit the model using *lme4* to obtain AIC values allowing downstream backwards selection (this assumes gaussian distribution).
+ - *URN* (individual infant) is a random effect that we want to account for but not measure.
+ - *Type* (of sample) is an interaction variable.
+
+```{r, warning=F, message=F, results='hide'}
+global <- lme4::lmer(Shannon ~  (Mode.of.Delivery + Feeding.Type +  
+                    Gestation_Days_scaled  + Antenatal.Antibiotics + 
+                    Antenatal..Infections + NEC + Sepsis + 
+                    Chorioamnionitis + Neonatal.Antibiotics + Died + 
+                    Prolonged..Membrane..Rupture + Preeclampsia + 
+                    Diabetes + ROP) * Type + (1|URN), data = ps_samp)
+```
+
+ - Calculate the goodness of fit (how the sample data fits the distribution) and  the Pearsons Chi Square coefficient (how likely observed differences arose by chance).
+ - Calculate these again post bakwards selection.
+ 
+```{r, eval=F}
+gof(global)
+sum(residuals(global,"pearson")^2)
+```
+
+### Backwards Selection.
+ - Define a function that determines what variable is contributing least to the model, as determined by AIC score.
+ - Then apply that function to the model, and subsequent models, removing variables from the model that are not contributing (first from the interaction and then from the model entirely).
+ 
+```{r, warning=F, message=F}
+dfun <- function(x) {
+  x$AIC <- x$AIC-min(x$AIC)
+  names(x)[2] <- "dAIC"
+  x
+}
+
+dfun(drop1(global))
+```
+
+```{r, warning=F, message=F}
+global2 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + (Mode.of.Delivery + Feeding.Type +  
+                      Gestation_Days_scaled  + Antenatal.Antibiotics + 
+                      Antenatal..Infections + NEC + Sepsis + Chorioamnionitis + Died + 
+                      Prolonged..Membrane..Rupture + Preeclampsia + Diabetes + ROP) * 
+                      Type + (1|URN), data = ps_samp)
+dfun(drop1(global2))
+```
+
+ - Continue backwards selection until least complex adequate model is found.
+ 
+```{r, include=F, eval=F}
+global3 <-  lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + (Mode.of.Delivery + Feeding.Type +  Gestation_Days_scaled  + Antenatal.Antibiotics + Antenatal..Infections + NEC + Chorioamnionitis + Died + Prolonged..Membrane..Rupture + Preeclampsia + Diabetes + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global3))
+```
+
+```{r, include=F, eval=F}
+global4 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + (Mode.of.Delivery + Feeding.Type +  Gestation_Days_scaled  + Antenatal.Antibiotics + NEC + Chorioamnionitis + Died + Prolonged..Membrane..Rupture + Preeclampsia + Diabetes + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global4))
+```
+
+```{r, include=F, eval=F}
+global5 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + Died + (Mode.of.Delivery + Feeding.Type +  Gestation_Days_scaled  + Antenatal.Antibiotics + NEC + Chorioamnionitis + Prolonged..Membrane..Rupture + Preeclampsia + Diabetes + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global5))
+```
+
+```{r, include=F, eval=F}
+global6 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + (Mode.of.Delivery + Feeding.Type +  Gestation_Days_scaled  + Antenatal.Antibiotics + NEC + Chorioamnionitis + Prolonged..Membrane..Rupture + Preeclampsia + Diabetes + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global6))
+```
+
+```{r, include=F, eval=F}
+global7 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + Prolonged..Membrane..Rupture + (Mode.of.Delivery + Feeding.Type +  Gestation_Days_scaled  + Antenatal.Antibiotics + NEC + Chorioamnionitis + Preeclampsia + Diabetes + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global7))
+```
+
+```{r, include=F, eval=F}
+global8 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + (Mode.of.Delivery + Feeding.Type +  Gestation_Days_scaled  + Antenatal.Antibiotics + NEC + Chorioamnionitis + Preeclampsia + Diabetes + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global8))
+```
+
+```{r, include=F, eval=F}
+global9 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + Diabetes + (Mode.of.Delivery + Feeding.Type +  Gestation_Days_scaled  + Antenatal.Antibiotics + NEC + Chorioamnionitis + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global9))
+```
+
+```{r, include=F, eval=F}
+global10 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + Diabetes + Feeding.Type +  (Mode.of.Delivery + Gestation_Days_scaled  + Antenatal.Antibiotics + NEC + Chorioamnionitis + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global10))
+```
+
+```{r, include=F, eval=F}
+global11 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + Diabetes + Feeding.Type + Chorioamnionitis + (Mode.of.Delivery + Gestation_Days_scaled  + Antenatal.Antibiotics + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global11))
+```
+
+```{r, include=F, eval=F}
+global12 <- lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + Feeding.Type + Chorioamnionitis + (Mode.of.Delivery + Gestation_Days_scaled  + Antenatal.Antibiotics + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global12))
+```
+
+```{r, include=F, eval=F}
+lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + Feeding.Type + Chorioamnionitis + Antenatal.Antibiotics + (Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global13))
+```
+
+```{r, include=F, eval=F}
+lme4::lmer(Shannon ~ Neonatal.Antibiotics + Sepsis + Antenatal..Infections + Feeding.Type + Chorioamnionitis + (Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global14))
+```
+
+```{r, include=F, eval=F}
+global15 <- lme4::lmer(Shannon ~ Sepsis + Antenatal..Infections + Feeding.Type + Chorioamnionitis + (Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global15))
+```
+
+```{r, message=F, warning=F}
+global16 <- lme4::lmer(Shannon ~ Sepsis + Feeding.Type + Chorioamnionitis + (Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp)
+dfun(drop1(global16))
+```
+
+ - Get a summary of the final model.
+ 
+```{r}
+summary(global16)
+```
+
+ - Explore model distribution (linearity).
+ 
+```{r, message=F, warning=F}
+plot(global16)
+```
+
+ - Explore model distribution (normality).
+ 
+```{r, message=F, warning=F}
+qqnorm(resid(global16)) 
+```
+
+ - Calculate the goodness of fit (how the sample data fits the distribution).
+ 
+```{r, warning=F, message=F}
+gof(global16)
+```
+
+ -  Calculate the Pearsons Chi Square coefficient (how likely observed differences arose by chance).
+ 
+```{r, warning=F, message=F}
+sum(residuals(global16,"pearson")^2)
+```
+
+ - Check R2 (good fit is between 0.2 - 0.4).
+
+```{r, warning=F, message=F}
+MuMIn::r.squaredGLMM(global16)
+```
+
+### Statistical tests for generalised linear model.
+
+ - Have the option to run `lmer()` from the *lmertest* package or use *car* to compute an analysis of variance.
+ - With *lmerTest*.
+ 
+```{r, warning=F, message=F}
+summary(lmer(Shannon ~ Sepsis + Feeding.Type + Chorioamnionitis + (Mode.of.Delivery + 
+             Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), 
+             data = ps_samp))
+```
+
+ - Export *lmerTest* results (either save previous command as an object or drop code into the function).
+ 
+```{r, eval=F}
+tab_model(global17, show.se = TRUE, string.se = "Standard Error", show.ci = FALSE, 
+          show.re.var = FALSE, show.ngroups = FALSE, show.icc = FALSE, 
+          title = "Linear Mixed Effects Model: Shannon Diversity Index", 
+          file = "lme4_global17.doc")
+```
+
+ - With *car*.
+ 
+```{r, warning=F, message=F}
+car::Anova(global16) %>%
+  as.data.frame(row.names = NULL)
+```
+
+ - Export *car* results (either save previous command as an object or drop code into the function).
+ 
+```{r, eval=F}
+tab_df(global_anova, alternate.rows = TRUE, show.rownames = TRUE, 
+       title = "ANOVA: Shannon Diversity lmer Model", file = "Shannon_Anova.doc")
+```
+ 
+ - Perform post-hoc Tukeys analysis to find pairwise differences.
+ 
+```{r, warning=F, message=F}
+as.data.frame(emmeans(global16, list(pairwise ~ Sepsis), adjust = "tukey"))
+```
+
+```{r, warning=F, message=F, eval=F}
+as.data.frame(emmeans(global16, list(pairwise ~ Feeding.Type), adjust = "tukey"))
+```
+
+```{r, warning=F, message=F, eval=F}
+as.data.frame(emmeans(global16, list(pairwise ~ Mode.of.Delivery:Type), adjust = "tukey"))
+```
+
+```{r, warning=F, message=F, eval=F}
+as.data.frame(emmeans(global16, list(pairwise ~ Preeclampsia:Type), adjust = "tukey"))
+```
+
+```{r, warning=F, message=F, eval=F}
+as.data.frame(emmeans(global16, list(pairwise ~ ROP:Type), adjust = "tukey"))
+```
+
+ - Export post-hoc results (either save previous commands as an object or drop code into the function).
+ 
+```{r, eval=F}
+tab_df(Sepsis_tukeys, alternate.rows = TRUE, show.rownames = TRUE, 
+       title = "Tukey's: Sepsis and Shannon Diversity", 
+       file = "Sepsis_tukeys.doc")
+```
+
+ - To get a summary for significant pairwise comparisons.
+
+```{r, eval=F}
+ddply(subset(ps_samp, Type == "Admission"), "Preeclampsia", summarise,
+               N    = length(Shannon),
+               mean = mean(Shannon),
+               sd   = sd(Shannon),
+               se   = sd / sqrt(N))
+```
+
+### Reintegration.
+
+ - Add variables from the first model back into the final model one at a time to calculate estimates, SE and p values for each.
+ 
+```{r, eval=F}
+summary(lmer(Shannon ~ Sepsis + Feeding.Type + Chorioamnionitis + 
+            (Antenatal.Antibiotics + Mode.of.Delivery + Gestation_Days_scaled  + 
+             NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp))
+```
+ 
+```{r, eval=F, include=F}
+summary(lmer(Shannon ~ Sepsis + Feeding.Type + Chorioamnionitis + (Antenatal..Infections + Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp))
+```
+ 
+```{r, eval=F, include=F}
+summary(lmer(Shannon ~ Sepsis + Feeding.Type + Chorioamnionitis + (Neonatal.Antibiotics + Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp))
+```
+ 
+```{r, eval=F, include=F}
+summary(lmer(Shannon ~ Sepsis + Feeding.Type + Chorioamnionitis + (Prolonged..Membrane..Rupture + Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp))
+```
+ 
+```{r, eval=F, include=F}
+summary(lmer(Shannon ~ Sepsis + Feeding.Type + Chorioamnionitis + (Diabetes + Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp))
+```
+ 
+```{r, eval=F, include=F}
+summary(lmer(Shannon ~ Sepsis + Feeding.Type + Chorioamnionitis + (Died + Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp))
+```
+ 
+```{r, eval=F, include=F}
+summary(lmer(Shannon ~ Feeding.Type + Chorioamnionitis + (Sepsis + Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp))
+```
+ 
+```{r, eval=F, include=F}
+summary(lmer(Shannon ~ Sepsis + Chorioamnionitis + (Feeding.Type + Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp))
+```
+
+```{r, eval=F, include=F}
+summary(lmer(Shannon ~ Sepsis + Feeding.Type + (Chorioamnionitis + Mode.of.Delivery + Gestation_Days_scaled  + NEC + Preeclampsia + ROP) * Type + (1|URN), data = ps_samp))
+```
+
+- Export reintigration results (either save previous commands as an object or drop code into the function).
+
+```{r, eval=F}
+tab_model(global18, terms = c("Antenatal.AntibioticsNo", "Antenatal.AntibioticsNo:TypeDischarge" ), 
+          show.se = TRUE, string.se = "Standard Error", show.ci = FALSE, show.re.var = FALSE, 
+          show.ngroups = FALSE, show.icc = FALSE, 
+          title = "Linear Mixed Effects Model: Shannon Diversity",
+          file = "lme4_antibiotics_reintigration.doc")
+```
+
+### Visualisation: plot significant variables as box plots.
+
+ - Create a function for the boxplots (as it gets repetitive) that takes the data, the variable and any added annotation as arguments.
+ - Any other variable-specifc specifications for the plots can be added after the function. **eg.** Variables that interact with *Type* are faceted by the variable with `+ facet_wrap(~Type)`.
+ 
+```{r, warning=F, message=F}
+shannon_box_plot <- function(data, variable, anno){ 
+  ggplot(data, aes(x = data[[variable]], y = data$Shannon)) +
+  geom_point(aes(colour = data[[variable]])) +
+  geom_boxplot(aes(colour = data[[variable]])) +
+  labs(x = variable, y = "") + 
+  theme(legend.position = "none") +
+  geom_text(data = anno, aes(x = xstar, y = ystar, 
+  label = lab, size = 12, fontface = "bold")) +
+  ylim(0, 5) 
+}
+```
+
+ - Wrap all the plots into a function so intermediate objects don't need to be created in environment.
+
+```{r, message=F, warning=F}
+box_grid <- function(ps_samp){
+# Delivery
+anno <- data.frame(xstar = c(1, 2), ystar = c(4.75, 4.75), lab = "") 
+ggplot_Mode.of.Delivery <- (shannon_box_plot(ps_samp, "Mode.of.Delivery", anno) +
+  facet_wrap(~Type))   %>%
+  annotate_figure(fig.lab = "A", fig.lab.face = "bold", fig.lab.size = 20)
+
+# Diet
+anno <- data.frame(xstar = c(1, 3), ystar = c(4.75, 4.75),lab = c("a", "b"))
+ggplot_Feeding.Type <- (shannon_box_plot(ps_samp, "Feeding.Type", anno)  +  
+  scale_x_discrete(labels = c("B", "B/F", "F"))) %>% 
+  annotate_figure(fig.lab = "B", fig.lab.face = "bold", fig.lab.size = 20)
+
+# Preeclampsia
+anno <- data.frame(xstar = c(1, 2), ystar = c(4.75, 4.75), lab = "") 
+ggplot_Preeclampsia <- (shannon_box_plot(ps_samp, "Preeclampsia", anno)  + 
+  facet_wrap(~Type)) %>% 
+  annotate_figure(fig.lab = "C", fig.lab.face = "bold", fig.lab.size = 20)
+
+# Sepsis
+anno <- data.frame(xstar = c(1, 2), ystar = c(4.75, 4.75), lab = c("a", "b"))
+ggplot_Sepsis <- shannon_box_plot(ps_samp, "Sepsis", anno) %>%
+  annotate_figure(fig.lab = "D", fig.lab.face = "bold", fig.lab.size = 20)
+
+# ROP
+anno <- data.frame(xstar = c(1, 2, 1), ystar = c(4.75, 4.75, 4.75),
+        lab = c("a", "b", "a"), Type = c("Admission", "Admission", "Discharge"))
+ggplot_ROP <- (shannon_box_plot(ps_samp, "ROP", anno)  + 
+  facet_wrap(~Type)) %>% 
+  annotate_figure(fig.lab = "E", fig.lab.face = "bold", fig.lab.size = 20)
+
+# Create the grid
+grid.arrange(ggplot_Mode.of.Delivery, ggplot_Feeding.Type, ggplot_Preeclampsia, ggplot_Sepsis, ggplot_ROP, nrow = 3, ncol = 2, left = textGrob("Shannon Index", gp = gpar(fontsize = 10), rot = 90)) 
+}
+
+box_grid(ps_samp)
+```
+
+ - Export box plot grid.
+ 
+```{r, eval=F}
+ggsave("Linear_model_boxplot.png", plot = (box_grid(ps_samp)), dpi = 600, height = 10, width = 10)
+```
+
+**FINISIHED** 
+
+[**Link to github repo.**](https://github.com/JacobAFW/NICU_Microbiome_Study)
+
