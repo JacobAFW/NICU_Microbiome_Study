@@ -6,7 +6,6 @@ This includes:
 
  - The full workflow from raw reads to analysis. 
  - The metadata (deidentified).
- - Some additional outputs from the analysis that may be of interest.
 
 ## Summary of methods
 ### Lab protocols
