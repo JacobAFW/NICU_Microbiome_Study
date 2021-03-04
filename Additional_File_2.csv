@@ -1,0 +1,31 @@
+Admission,,n,Discharge,,n
+Diet,Breastmilk,38,Diet,Breastmilk,26
+,Formula,16,,Formula,14
+,Breastmilk & formula,17,,Breastmilk & formula,23
+Mode of delivery,Cesarean,42,Mode of delivery,Cesarean,47
+,Vaginal,29,,Vaginal,16
+NEC,Yes,7,NEC,Yes,5
+,No,64,,No,58
+Sepsis,Yes,6,Sepsis,Yes,2
+,No,65,,No,61
+Died,Yes,5,Died,Yes,2
+,No,66,,No,61
+Antenatal antibiotics,Yes,51,Antenatal antibiotics,Yes,39
+,No,20,,No,24
+Neonatal antibiotics,Yes,66,Neonatal antibiotics,Yes,60
+,No,5,,No,3
+Preeclampsia,Yes,10,Preeclampsia,Yes,10
+,No,61,,No,53
+Chorioamnionitis,Yes,31,Chorioamnionitis,Yes,27
+,No,40,,No,36
+Antenatal infections,Yes,28,Antenatal infections,Yes,18
+,No,43,,No,45
+Prolonged membrane rupture,Yes,30,Prolonged membrane rupture,Yes,26
+,No,41,,No,37
+Diabetes,Yes,12,Diabetes,Yes,12
+,No,59,,No,51
+ROP,Yes,23,ROP,Yes,22
+,No,48,,No,41
+Birth weight,Mean,1209.789 (g),Nursery discharge weight,Mean,2585.476 (g)
+,,,,,
+,,,,,
