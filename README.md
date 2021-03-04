@@ -6,6 +6,7 @@ This includes:
 
  - The full workflow, from raw reads to analysis. 
  - The metadata (deidentified).
+ - Summary of the metadata.
 
 For context, below is a summary of the methods used in this study.
 
