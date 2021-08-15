@@ -1,0 +1,306 @@
+---
+title: "Generalised linear mixed effects modelling for determining covariates of alpha"
+output: pdf_document
+author: "Jacob Westaway"
+date: "Last updated on `r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = 'C:/Users/Jacob/Desktop/Jacob_Uni/Data/NICUMicro_R')
+load(file = "C:/Users/Jacob/Desktop/Jacob_Uni/Data/NICUMicro_R/scripts/Rmd.RData")
+```
+
+# About
+
+To examine the effect of several covariates on Shannon diversity, a generalised linear mixed effects regression model was created using lme4. Shannon diversity was calculated at the ASV level (normalised through TSS), and continuous predictors were scaled and centered. Multicollinearity was assessed with the AED package, and collinear variables were removed. To control for high inter-individual variation in the preterm infant microbiome, the infants identification was included as a random factor. 
+
+After creation of the initial model with [lme4](https://cran.r-project.org/web/packages/lme4/vignettes/lmer.pdf), backwards selection was used to find the least complex, yet adequate, model by comparing Akaike’s Information Criterion (AIC) scores and removing predictors that did not contribute to variation in the model. A post-hoc pairwise Tukey comparison (correcting for multiple comparisons) was used to assess the effect of covariates using the emmeans package.
+
+The code to create the data objects used in this workflow can be found in the ['Pipeline.Rmd'](https://github.com/JacobAFW/NICU_Microbiome_Study).
+
+
+## Packages
+
+```{r,warning=F,message=F,results='hide'}
+sapply(c("phyloseq", "tidyverse", "knitr", "lme4", "emmeans", "gridExtra",
+         "MuMIn", "aods3", "sjPlot", "ggpubr", "lmerTest", "car", "knitr"), 
+        require, character.only = TRUE)
+```
+
+# Subset data.
+
+ - Subset ps to exclude SCN and NA values.
+ - Scale continuous variables.
+ - Estimate richness and save as object.
+ - create a new variable column with rownames.
+ - merge alpha diversity estimates (*ps_alpha_div*) with the metadata (*samdf*) by the *Label* column (orignially row names), for downstream analysis.
+ 
+```{r, warning=F, message=F, eval=F}
+ps.NICU <- subset_samples(ps, 
+                 Primary_Group == "NICU" & 
+                 (Type == "Admission" | Type == "Discharge")) 
+
+centre_and_scale <- function(data){
+# get numeric variables
+data2 <- data %>% 
+  select_if(is.numeric)
+# entering and scaling over variables
+data3 <- sapply(data2, function(x) scale(x, center=T, scale = 2*sd(x))) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("RowID") 
+# join scaled/centred data to non-numeric data
+data %>% 
+  select_if(negate(is.numeric)) %>%
+  rownames_to_column("RowID") %>% 
+  left_join(data3, by = "RowID") %>%
+  select(-RowID) 
+}
+
+
+sample_data(ps.NICU) <- sample_data(ps.NICU) %>% 
+  unclass() %>% 
+  as.data.frame() %>% 
+  filter(!is.na(Days_on_antibiotics)) %>% # omit NA samples for modelling
+  filter(!is.na(Days_since_birth)) %>% 
+  centre_and_scale() %>%   
+  mutate("Sample" = Label) %>% # redo rownames to save it back into the original ps object
+  column_to_rownames("Sample")
+
+ps_alpha_div <- ps.NICU %>%
+                estimate_richness(measures = c("Shannon")) %>%
+                add_column(Label = row.names(sample_data(ps.NICU))) 
+
+ps_samp <- sample_data(ps.NICU) %>%
+  unclass() %>%
+  data.frame() %>%
+  left_join(ps_alpha_div, by = "Label")
+```
+
+# Centre and scale data
+
+```{r, warning=F, message=F, eval=F}
+# define centre and scale function
+centre_and_scale <- function(data){
+# get numeric variables
+data2 <- data %>% 
+  select_if(is.numeric)
+# entering and scaling over variables
+data3 <- sapply(data2, function(x) scale(x, center=T, scale = 2*sd(x))) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("RowID")
+# join scaled/centred data to non-numeric data
+data %>% 
+  select_if(negate(is.numeric)) %>%
+  rownames_to_column("RowID") %>% 
+  left_join(data3, by = "RowID") %>%
+  select(-RowID)
+}
+
+glm_data <- ps_metadata %>% 
+  mutate(Shannon = as.factor(Shannon)) %>% 
+  centre_and_scale() %>% 
+  mutate(Shannon = as.character(Shannon)) %>% 
+  mutate(Shannon = as.numeric(Shannon))
+```
+
+# Test for collinearity 
+
+```{r,warning=F,message=F}
+# defin myvif function
+myvif <- function(mod) {
+  v <- vcov(mod)
+  assign <- attributes(model.matrix(mod))$assign
+  if (names(coefficients(mod)[1]) == "(Intercept)") {
+    v <- v[-1, -1]
+    assign <- assign[-1]
+  } else warning("No intercept: vifs may not be sensible.")
+  terms <- labels(terms(mod))
+  n.terms <- length(terms)
+  if (n.terms < 2) stop("The model contains fewer than 2 terms")
+  if (length(assign) > dim(v)[1] ) {
+    diag(tmp_cor)<-0
+    if (any(tmp_cor==1.0)){
+      return("Sample size is too small, 100% collinearity is present")
+    } else {
+      return("Sample size is too small")
+    }
+  }
+  R <- cov2cor(v)
+  detR <- det(R)
+  result <- matrix(0, n.terms, 3)
+  rownames(result) <- terms
+  colnames(result) <- c("GVIF", "Df", "GVIF^(1/2Df)")
+  for (term in 1:n.terms) {
+    subs <- which(assign == term)
+    result[term, 1] <- det(as.matrix(R[subs, subs])) * det(as.matrix(R[-subs, -subs]))/detR
+    result[term, 2] <- length(subs)
+  }
+  if (all(result[, 2] == 1)) {
+    result <- data.frame(GVIF=result[, 1])
+  } else {
+    result[, 3] <- result[, 1]^(1/(2 * result[, 2]))
+  }
+  invisible(result)
+}
+
+# corvif
+corvif <- function(data) {
+  data <- as.data.frame(data)
+
+  form    <- formula(paste("fooy ~ ",paste(strsplit(names(data)," "),collapse = " + ")))
+  data  <- data.frame(fooy = 1 + rnorm(nrow(data)) ,data)
+  lm_mod  <- lm(form,data) # runs linear model with above formula and metadata
+  
+  cat("\n\nVariance inflation factors\n\n")
+  print(myvif(lm_mod))
+}
+
+ps_samp %>% 
+  mutate(Days_since_birth = as.numeric(difftime(.$Date_Collected, .$DOB, units = "days"))) %>% 
+  mutate(Gest_at_collection = Days_since_birth + Gestational.Age.at.Birth) %>% 
+  select(Type, Feeding.Type , NEC , Sepsis , Mode.of.Delivery , Chorioamnionitis ,
+          Preeclampsia, ROP, Diabetes , Antenatal.Antibiotics, Antenatal..Infections, 
+         Gest_at_collection, Prolonged..Membrane..Rupture, Died, Days_on_antibiotics) %>%
+  corvif() %>% 
+  kable()
+```
+
+# Fit Model
+
+```{r,warning=F,message=F,eval=F}
+global <- lme4::lmer(Shannon ~  (Mode.of.Delivery + Feeding.Type +  
+                    Gestational.Age.at.Birth  + Antenatal.Antibiotics + 
+                    Antenatal..Infections + NEC + Sepsis + 
+                    Chorioamnionitis + Died + 
+                    Prolonged..Membrane..Rupture + Preeclampsia + Gest_at_collection +
+                    Diabetes + ROP + Days_on_antibiotics) * Type + (1|URN), data = ps_samp)
+
+summary(lmer(Shannon ~  (Mode.of.Delivery + Feeding.Type +  
+                    Gestational.Age.at.Birth  + Antenatal.Antibiotics + 
+                    Antenatal..Infections + NEC + Sepsis + 
+                    Chorioamnionitis + Neonatal.Antibiotics + Died + 
+                    Prolonged..Membrane..Rupture + Preeclampsia + Gest_at_collection +
+                    Diabetes + ROP) * Type + (1|URN), data = ps_samp)) 
+```
+
+ - Calculate the goodness of fit (how the sample data fits the distribution), the Pearsons Chi Square coefficient (how likely observed differences arose by chance) and the R2.
+ - Calculate these again post bakwards selection.
+ 
+```{r, eval=F}
+gof(global)
+sum(residuals(global,"pearson")^2)
+r.squaredGLMM(global)
+```
+
+# Backwards Selection.
+
+ - Define a function that determines what variable is contributing least to the model, as determined by AIC score.
+ - Then apply that function to the model, and subsequent models, removing variables from the model that are not contributing (first from the interaction and then from the model entirely).
+ 
+```{r, warning=F, message=F,eval=F}
+dfun <- function(x) {
+  x$AIC <- x$AIC-min(x$AIC)
+  names(x)[2] <- "dAIC"
+  x
+}
+
+dfun(drop1(global))
+```
+
+```{r, warning=F, message=F,eval=F}
+global2 <- lme4::lmer(Shannon ~  Sepsis + Antenatal.Antibiotics + Gestational.Age.at.Birth  
+                      + Gest_at_collection + Feeding.Type + (Mode.of.Delivery +  NEC +  
+                     Preeclampsia + ROP + Days_on_antibiotics) * Type + (1|URN),
+                     data = ps_samp)
+
+dfun(drop1(global2))
+```
+
+ - Calculate the goodness of fit (how the sample data fits the distribution), the Pearsons Chi Square coefficient (how likely observed differences arose by chance) and the R2.
+ 
+```{r, warning=F, message=F,eval=F}
+gof(global)
+sum(residuals(global,"pearson")^2)
+r.squaredGLMM(global)
+```
+
+# Final Model
+
+```{r,warning=F,message=F}
+lmer(Shannon ~  Sepsis + Antenatal.Antibiotics + Gestational.Age.at.Birth  + 
+                        Gest_at_collection + Feeding.Type + (Mode.of.Delivery +  NEC +  
+                     Preeclampsia + ROP + Days_on_antibiotics)* Type + (1|URN), 
+                     data = ps_samp) %>% 
+                  summary()
+```
+
+# Analysis of deviance
+
+```{r,warning=F,message=F}
+car::Anova(global2) %>%
+  as.data.frame(row.names = NULL)
+```
+
+# Post-hoc pairwiset testing, accounting for multiple comparisons
+
+```{r,warning=F,message=F}
+emmeans(global2, list(pairwise ~ Sepsis), adjust = "tukey")
+```
+
+```{r,warning=F,message=F}
+emmeans(global2, list(pairwise ~ Feeding.Type), adjust = "tukey")
+```
+
+```{r,warning=F,message=F}
+emmeans(global2, list(pairwise ~ ROP:Type), adjust = "tukey")
+```
+
+# Visulatisation: all variables in final model as an estimates sjplot
+
+```{r,warning=F,message=F}
+sjPlot::plot_model(global2, 
+                   vline.color = "black", 
+                   sort.est = TRUE, 
+                   title = "GLM for Shannon diversity") 
+```
+
+# Visualisation: plot significant variables as box plots.
+
+ - Create a function for the boxplots that takes the data, the variable and any added annotation as arguments.
+ - Any other variable-specifc specifications for the plots can be added after the function. **eg.** Variables that interact with *Type* are faceted by the variable with `+ facet_wrap(~Type)`.
+ - Wrap all the plots into a function so intermediate objects don't need to be created in environment.
+
+```{r, message=F, warning=F}
+box_grid <- function(ps_samp){
+# Diet
+anno <- data.frame(xstar = c(1, 3), ystar = c(4.75, 4.75),lab = c("a", "b"))
+ggplot_Feeding.Type <- (shannon_box_plot(ps_samp, "Feeding.Type", anno)  +  
+  scale_x_discrete(labels = c("B", "B/F", "F")) +
+  xlab("Diet")) %>% 
+  annotate_figure(fig.lab = "A", fig.lab.face = "bold", fig.lab.size = 20)
+
+# Sepsis
+anno <- data.frame(xstar = c(1, 2), ystar = c(4.75, 4.75), lab = c("a", "b"))
+ggplot_Sepsis <- (shannon_box_plot(ps_samp, "Sepsis", anno) +
+                  ylab("")) %>%
+  annotate_figure(fig.lab = "B", fig.lab.face = "bold", fig.lab.size = 20)
+
+# ROP
+anno <- data.frame(xstar = c(1, 2), ystar = c(4.75, 4.75),
+        lab = c("a", "b"), Type = c("Admission", "Admission"))
+ggplot_ROP <- (shannon_box_plot(ps_samp, "ROP", anno)  + 
+  facet_wrap(~Type)  +
+  ylab("")) %>% 
+  annotate_figure(fig.lab = "C", fig.lab.face = "bold", fig.lab.size = 20)
+
+# Create the grid
+grid.arrange(ggplot_Feeding.Type, ggplot_Sepsis, ggplot_ROP, nrow = 1, ncol = 3) 
+}
+
+box_grid(ps_samp)
+
+ggsave("Figure_4.jpg", plot = (box_grid(ps_samp)), dpi = 600, height = 7, width = 10)
+```
+
+# FINISHED

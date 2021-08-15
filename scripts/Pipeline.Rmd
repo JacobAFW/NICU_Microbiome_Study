@@ -1,0 +1,1063 @@
+---
+title: "Pipeline"
+output: pdf_document
+author: "Jacob Westaway"
+date: "Last updated on `r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = 'C:/Users/Jacob/Desktop/Jacob_Uni/Data/NICUMicro_R')
+load(file = "C:/Users/Jacob/Desktop/Jacob_Uni/Data/NICUMicro_R/scripts/Rmd.RData")
+```
+
+# About.
+
+This document contains the pipepline and preliminary analyses for the manuscript *The bacterial gut microbiome of probiotic-treated very-preterm infants – Changes from admission to discharge*. The first part of this workflow goes raw reads to interpretable abundances, and is based largely around this [DADA2](https://pubmed.ncbi.nlm.nih.gov/27508062/) workflow developed by *Callahan, et al.*), in combination with removal of contamination with [MicroDecon](https://onlinelibrary.wiley.com/doi/full/10.1002/edn3.11). The subsequent analyses uses a combination of packages, most notably [phloseq](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0061217), [DESeq2](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-014-0550-8), [lme4](https://cran.r-project.org/web/packages/lme4/vignettes/lmer.pdf), amongst many others.
+
+
+
+# Creating an ASV table from raw reads, using [DADA2](https://pubmed.ncbi.nlm.nih.gov/27508062/).
+
+## Load required packages.
+
+```{r, warning=F, message=F, results='hide'}
+sapply(c("dada2", "phyloseq", "DECIPHER", "phangorn", "BiocManager", "BiocStyle", 
+        "Biostrings", "ShortRead", "ggplot2", "gridExtra", "knitr","tibble"), 
+        require, character.only = TRUE)
+```
+
+## Read quality.
+
+### Organise forward and reverse fastq filenames into own lists (check file format).
+ - First define the file path to the directory containing the fastq files (we will use this several times).
+ 
+```{r, warning=F, message=F,eval=F}
+path <-"Data/"
+
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq.gz", full.names = TRUE))
+
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq.gz", full.names = TRUE))
+```
+
+### Extract sample names.
+
+```{r, warning=F, message=F,eval=F}
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+\newpage
+
+### Check quality of Forward and Reverse Reads (used to define truncLen in filtering).
+
+```{r, warning=F, fig.cap="Quality of forward reads.", message=F}
+plotQualityProfile(fnFs[1:2])
+```
+
+```{r, warning=F, fig.cap="Quality of reverse reads.", message=F}
+plotQualityProfile(fnRs[1:2])
+```
+
+### Assign names for filtered reads.
+
+```{r, warning=F, message=F,eval=F}
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+```
+
+### Filter and trim the reads. 
+ - Paremeters based on data and quality plots. 
+ - `truncLean` defined by when quality plots begin to drop off, but ensuring it is large enough to maintain read overlap (=>20bp) downstream.
+ - `trimLeft = c(16,21)` is used to remove primers (16 and 21 are F and R primer length).
+ - `maxEE = c(2,2)` is for filtering, where the higher the value the more relaxed filtering,allowing more reads to get through. 
+ - Good quality data should allow for more stringent parameters (2 is stringent).
+ - The number of reads filtered is checked. If reads are too low, can alter parameters.
+ 
+```{r, warning=F, message=F,eval=F}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen = c(280,200), 
+                     trimLeft = c(16,21), 
+                     maxN = 0, 
+                     maxEE = c(2,2), 
+                     truncQ = 2, 
+                     rm.phix = TRUE,
+                     compress = TRUE, 
+                     multithread = FALSE) # windows can't support multithread
+head(out)
+```
+
+## Infer sequence variants.
+
+### Calculate Error Rates.
+ - Error rates are used for sample ineference downstream.
+ 
+```{r, warning=F, message=F, results='hide',eval=F}
+errF <- learnErrors(filtFs, multithread=TRUE)
+
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+### Plot error rates. 
+ - Estimated error rates (black line) should be a good fit to observed rates (points) and error should decrease.
+ 
+```{r, warning=F, fig.cap="Error rates for forward reads", message=F}
+plotErrors(errF, nominalQ=TRUE)
+```
+
+```{r, warning=F, fig.cap="Error rates for reverse reads.", message=F}
+plotErrors(errR, nominalQ=TRUE)
+```
+
+### Dereplication.
+ - Combine indentical sequences into unique sequence bins.
+ - Name the derep-class objects by the sample name.
+ 
+```{r, warning=F, message=F,eval=F}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+names(derepFs) <- sample.names
+
+names(derepRs) <- sample.names
+```
+
+### Sample Inference.
+
+```{r, warning=F, message=F, results='hide',eval=F}
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+```
+
+### Inspect denoised data.
+
+```{r, warning=F, message=F, results='hide',eval=F}
+dadaFs[[1]]
+
+dadaRs[[1]]
+```
+
+### Merge Paired Reads and inspect merged data.
+ - Removes paired reads that do not perfectly overlap.
+ - Arguments represent infered samples AND denoised reads.
+ 
+```{r, warning=F, message=F, results='hide',eval=F}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+```
+
+## Construct amplicon sequence variance (ASV) table and remove chimeras.
+
+### Construct ASV table.
+ - Check dimentions and inspect distribution of sequence lengths.
+ 
+```{r, warning=F, message=F, results='hide',eval=F}
+seqtab <- makeSequenceTable(mergers)
+
+dim(seqtab)
+
+table(nchar(getSequences(seqtab)))
+```
+
+### Merging multiple sequence runs.
+ - Merging must be done after filtering.
+ - *seqtab.pilot* is a pilot dataset that was included in the overall analysis.
+ 
+```{r, include=F,eval=F}
+# Reading in pilot data for rmd.
+seqtab.pilot <- read.csv("Pipeline_Graphs/seqtab.pilot", row.names = 1) %>%
+  as.matrix()
+```
+ 
+```{r, warning=F, message=F,eval=F}
+seqtab.merged <- mergeSequenceTables(seqtab, seqtab.pilot)
+```
+
+### Remove chimeras.
+```{r, warning=F, message=F,eval=F}
+seqtab.nochim <- removeBimeraDenovo(seqtab.merged, method="consensus", 
+                                    multithread=TRUE, verbose=TRUE)
+```
+
+### Track reads through pipeline.
+
+```{r, warning=F, message=F}
+getN <- function(x) sum(getUniques(x))
+
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), 
+               sapply(mergers, getN), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+
+rownames(track) <- sample.names
+
+head(track)
+```
+
+## Contamination removal with *MicroDecon*.
+
+```{r, warning=F, message=F,eval=F}
+library(microDecon)
+```
+ 
+### Reformat data for *MicroDecon*.
+ - Transpose sequencing table (post chimera removal) and convert to a dataframe.
+ 
+```{r, warning=F, results='hide', message=F,eval=F}
+microdecon.df <- t(seqtab.nochim) %>%
+  as.data.frame()
+```
+
+ - Determine which columns the blank samples belong to (for the second half of micrdecon(), otherwise an error occurs).
+ 
+```{r, eval=F,eval=F}
+which(colnames(microdecon.df)=="183" | colnames(microdecon.df)=="182" | 
+        colnames(microdecon.df)=="181" | colnames(microdecon.df)=="179" | 
+        colnames(microdecon.df)=="145" | colnames(microdecon.df)=="99")
+```
+ 
+ - Make blank samples the first 6 columns.
+ - Remove blanks 99 (column 6) and 145 (column 5) (blanks 99 and 145 are both distinct from the other blanks, and appear to be contaminated by adjacent samples sometime during library prepeartion, so we will remove these two blanks prior to running MicroDecon).
+ 
+```{r, warning=F, results='hide', message=F,eval=F}
+microdecon.df.blanks <- cbind.data.frame(microdecon.df[,c("183", "182", "181", 
+                                                          "179", "145", "99")],
+                                         microdecon.df[, -c(84, 83, 82, 80, 46, 165)])
+
+microdecon.df.blanks.2 <- microdecon.df.blanks[,-c(6, 5)]
+```
+
+ - Can check how many columns were removed with: 
+ `ncol(microdecon.df.blanks) - ncol(microdecon.df.blanks.2)`.
+
+### Restructure dataframe to a priori grouping.
+ - Read in "ColNames.csv", which has the column names from the metadata restructured (as rows in column A of an excel spreadsheet) so that they are in the below priori groupings:
+    - NICU Admission
+    - NICU Discharge
+    - NICU Unknown
+    - SCN
+    - Other
+ - When read in, the data should look like this:
+ 
+`V1`  
+`<fctr>`  
+`179`				
+`181`				
+`182`				
+`183`				
+`2`				
+`3`				
+`6`				
+`3b`				
+`20`				
+`21`
+
+ - Then reorder the microdecon.df.blanks.2 by the imported csv file.
+ - **NB.** this can be done using the *tidyverse* but it is also convoluted.
+ 
+```{r, warning=F, message=F, results='hide',eval=F}
+col.names <- read.csv("ColNames.csv", header = FALSE)
+
+col.order <- col.names[,1]
+
+microdecon.df.3 <- microdecon.df.blanks.2[,match(col.order, 
+                   colnames(microdecon.df.blanks.2))]
+```
+
+#### Make column 1 the ASV/OTU names.
+ - *MicroDecon* requires that the OTUs have a unique ID in column 1.
+ - Take the rownames from microdecon.df.3 and create a column with these names.
+ - Can check with `length(unique(microdecon.df.3.names[,1])) == nrow(microdecon.df.3)`.
+ 
+```{r, warning=F, message=F,eval=F}
+microdecon.df.3.names <- cbind.data.frame(rownames(microdecon.df.3), microdecon.df.3)
+```
+
+### Decontaminate data using `decon()`.
+ - `numb.ind` is the number of columns for each priori grouping.
+ - `taxa = F` as there is no taxonomy in the dataframe.
+ 
+```{r, warning=F, message=F,eval=F}
+decontaminated <- decon(data = microdecon.df.3.names, numb.blanks = 4, 
+                  numb.ind = c(68, 66, 9, 14, 8), taxa = F)
+```
+
+#### Check *MicroDecon* Outputs.
+```{r, eval=F, message=F,eval=F}
+decontaminated$decon.table
+decontaminated$reads.removed
+decontaminated$OTUs.removed %>% View()
+decontaminated$mean.per.group
+decontaminated$sum.per.group
+```
+
+### Reformat decon.table.
+ - Convert column 1 to row names.
+ - Remove blank average column (1).
+ - Save rownames as seperate vector to be added back, as row names are removed during apply().
+ - Convert numeric values to integers (for downstream analysis).
+ - Transpose data.
+ 
+```{r, warning=F, message=F,eval=F}
+seqtab.microdecon <- decontaminated$decon.table %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "rownames(microdecon.df.3)")
+
+seqtab.microdecon <- seqtab.microdecon[,-1]
+
+save.rows <- rownames(seqtab.microdecon)
+
+seqtab.microdecon <- apply(seqtab.microdecon,2,as.integer)
+
+rownames(seqtab.microdecon) <- save.rows
+
+seqtab.microdecon <- t(seqtab.microdecon)
+```
+
+## Assign taxonomy.
+ - With optional species addition (there is an agglomeration step downstream, so you can add species now for curiosities sake, and remove later for analysis).
+ 
+```{r, warning=F, message=F,eval=F}
+taxa <- assignTaxonomy(seqtab.microdecon, "silva_nr_v132_train_set.fa.gz")
+
+taxa <- addSpecies(taxa, "silva_species_assignment_v132.fa.gz")  
+
+taxa.print <- taxa # Removes sequence rownames for display only
+rownames(taxa.print) <- NULL
+```
+
+# Preprocessing: Creating a Phyloseq Object.
+
+## About.
+Creating a [phyloseq](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0061217) object to be used for analysis, and create different objects to be used for different types of analysis downstream.
+
+## Load required packages. 
+
+```{r, warning=F, message=F, results='hide'}
+sapply(c( "shiny","miniUI", "caret", "pls", "e1071", "ggplot2", 
+    "randomForest", "dplyr", "ggrepel", "nlme", "devtools", 
+    "reshape2", "PMA", "structSSI", "ade4","ggnetwork", 
+    "intergraph", "scales", "readxl", "genefilter", "impute", 
+    "phyloseq", "phangorn", "dada2", "DECIPHER", "gridExtra", "tidyverse"), 
+    require, character.only = TRUE)
+```
+
+## Constuct a phylogenetic tree (for Phyloseq object downstream, required for distance measures).
+ - Peform multiple-allignment.
+ - `pml` calculates the likelihood of a given tree, and then `optim.pml()` optimizes the tree topology and branch length for the selected model (GTR+G+I max tree).
+
+```{r, warning=F, message=F, results='hide',eval=F}
+seqs <- getSequences(seqtab.microdecon)
+
+names(seqs) <- seqs 
+
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA, verbose=FALSE)
+
+phangAlign <- phyDat(as(alignment, "matrix"), type = "DNA")
+
+fitGTR <- phangAlign %>%
+  dist.ml() %>%
+  NJ() %>%
+  pml(data = phangAlign) %>%
+  update(k = 4, inv = 0.2) %>%
+  optim.pml(model = "GTR", optInv = TRUE, optGamma = TRUE, 
+  rearrangement = "NNI", control = pml.control(trace = 0))
+
+detach("package:phangorn", unload = TRUE) # conflicts downstream
+```
+
+## Import metadata and construct dataframe.
+ - Use ID column for row names.
+
+```{r, warning=F, message=F, results='hide',eval=F}
+samdf <- read_excel("SAMPLE_INFORMATION.xlsx", sheet = 1, 
+         col_names = TRUE, col_types = NULL, skip = 0) %>%
+         data.frame(row.names = "ID") %>% 
+         mutate(DOB = as.Date(DOB)) %>% 
+         mutate(Date_of_Birth = as.Date(Date_of_Birth)) %>% 
+  left_join(
+    read_excel("Metadata/Additional_Clinical_Data.xlsx") %>% # reviewer requested data
+      select(ID, Days_on_antibiotics, Sex) %>% 
+      rename("Label" = ID)
+    )  %>%  
+  mutate(Days_since_birth = as.numeric(difftime(.$Date_Collected, .$DOB, units = "days"))) %>% 
+  mutate(Gest_at_collection = Days_since_birth + Gestational.Age.at.Birth) %>% 
+  mutate(ID = Label) %>% 
+  column_to_rownames("ID")
+```
+
+## Constrcut the Phyloseq object.
+ - Includes: metadata, ASV table, taxonomy table and phylogenetic tree.
+ 
+```{r, warning=F, message=F, results='hide',eval=F}
+ps <- phyloseq(otu_table(seqtab.microdecon, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa),
+               phy_tree(fitGTR$tree))
+```
+
+## Wrangling the metadata.
+ - And do some additional wrangling.
+ - Convert chraracters to factors.
+ - Duplicate the label column, and then convert to newly created duplicate into rownames (need the original column downstream).
+
+```{r, warning=F, message=F, results='hide',eval=F}
+sample_data(ps) <- sample_data(ps) %>%
+  unclass() %>%
+  as.data.frame() %>% 
+  mutate_if(is.character, as.factor) %>%
+  mutate("Label2" = Label) %>% 
+  column_to_rownames("Label2") %>%
+  dplyr::rename(Diabetes = Diabetetes) 
+```
+
+## Filtering and normalisation.
+
+### Taxonomy filtering.
+ - Can check the number of phyla before and after transformation with `table(tax_table(ps)[, "Phylum"], exclude = NULL)`.
+ - Remove features with ambiguous and NA phylum annotation.
+
+```{r, warning=F, message=F, results='hide',eval=F}
+ps <- subset_taxa(ps, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+```
+
+### Prevelance filtering.
+ - Using an unsupervised method (relying on the data in this experiment) explore the prevelance of features in the dataset.
+ - Calculate the prevalence of each feature and store as a dataframe.
+ - Add taxonomy and total read counts.
+ 
+```{r, warning=F, message=F, results='hide',eval=F}
+prevdf = apply(X = otu_table(ps),
+               MARGIN = ifelse(taxa_are_rows(ps), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(ps),
+                    tax_table(ps))
+```
+
+ - Plot the relationship between prevelance and total read count for each feature. This provides information on outliers and ranges of features.
+ 
+```{r, warning=F, message=F, fig.cap="Scatterplot exploring the relationship between prevelance and abundance of phyla."}
+prevdf %>%
+  subset(Phylum %in% get_taxa_unique(ps, "Phylum")) %>%
+  ggplot(aes(TotalAbundance, Prevalence / nsamples(ps),color=Phylum)) +
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 1) +  
+  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  
+  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+ - Define prevalence threshold based on the plot (~1% is standard) and apply to ps object (if prevelance is too low don't designate a threshold).
+ 
+```{r, warning=F, message=F, results='hide',eval=F}
+prevalenceThreshold = 0.01 * nsamples(ps)
+
+keepTaxa = rownames(prevdf)[(prevdf$Prevalence >= prevalenceThreshold)]
+
+ps2 = prune_taxa(keepTaxa, ps)
+```
+
+ - Explore the relationship on the filtered data set.
+```{r, warning=F, message=F, fig.cap="Scatterplot exploring the relationship between prevelance and abundance of phyla on data passed through a prevalence threshold."}
+prevdf %>%
+  subset(Phylum %in% get_taxa_unique(ps2, "Phylum")) %>%
+  ggplot(aes(TotalAbundance, Prevalence / nsamples(ps2),color=Phylum)) +
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 1) +  
+  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  
+  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+### Aggolmerate taxa.
+ - Combine features that descend from the same genus as most species have not been identified due to the poor sequencing depth in 16S.
+ - Can check how many genera would be present after filtering by running `length(get_taxa_unique(ps2, taxonomic.rank = "Genus"))`, and `ntaxa(ps3)` will give the number of post agglomeration taxa.
+ 
+```{r, warning=F, message=F, results='hide',eval=F}
+ps3 = tax_glom(ps2, "Genus", NArm = TRUE)
+```
+
+ - Create tree plots to observe pre and post agglomeration.
+ 
+```{r, warning=F, message=F, fig.cap="Tree plots exploring the agglomeration of taxa at the genus level."}
+grid.arrange(nrow = 1, 
+    (plot_tree(ps2, method = "treeonly",
+      ladderize = "left", title = "Before Agglomeration") +
+      theme(plot.title = element_text(size = 15))), 
+    (plot_tree(ps3, method = "treeonly",
+      ladderize = "left", title = "Post Genus Agglomeration") +
+      theme(plot.title = element_text(size = 15))))
+```
+
+### Normalisation.
+
+ - Plot a refraction curve to see if total sum scaling will surfice.
+ - Define colours and lines.
+ - Step = step size for sample sizes in rarefaction curve.
+ 
+```{r, warning=F, message=F}
+vegan::rarecurve(t(otu_table(ps3)), step = 20, label = FALSE, main = "Rarefaction Curve", 
+        col = c("black", "darkred", "forestgreen", "orange", "blue", "yellow", "hotpink"))
+```
+
+ - Perform total sum scaling on agglomerated dataset.
+ 
+```{r, warning=F, message=F,eval=F}
+ps4 <- transform_sample_counts(ps3, function(x) x / sum(x))
+```
+
+### Subset phyloseq object for data to be analyzed.
+
+```{r, warning=F, message=F, results='hide'}
+ps4.NICU_no_na <- subset_samples(ps4, 
+              Primary_Group == "NICU" & 
+              (Type == "Admission" | Type == "Discharge"))
+```
+
+ - Explore normalisation with tree plots.
+ 
+```{r, warning=F, message=F, fig.cap="Tree plot exploring the normalised distribution of taxa between admission and discharge samples."}
+plot_tree(ps4.NICU_no_na, size = "Abundance", color = "Type", 
+    justify = "yes please", ladderize = "left") +
+    labs(title = "Phylogenetic Tree and Relative Abundance") +
+    scale_size_continuous(range = c(.5, 3))
+```
+
+ - Explore normalisation with violin plots.
+ - Compares differences in scale and distribution of the abundance values before and after transformation.
+ - Using arbitrary subset, based on Phylum = Firmicutes, for plotting (ie. can explore any taxa to observe transformation).
+ 
+```{r, warning=F, message=F, fig.cap="Violin plots exploring of distribution of abundance in Firmicutes before and after normalisation of data. Annotation for x axis; A: Admission, D: Discharge & I: Intermediate."}
+plot_abundance = function(physeq, Title = "Abundance", Facet = "Order", Color = "Phylum", variable = "Type"){
+    subset_taxa(physeq, Phylum %in% c("Firmicutes")) %>%
+    psmelt() %>%
+    subset(Abundance > 0) %>%
+    ggplot(mapping = aes_string(x = variable, y = "Abundance", color = Color, fill = Color)) +
+      geom_violin(fill = NA) +
+      geom_point(size = 1, alpha = 0.3, position = position_jitter(width = 0.3)) +
+      facet_wrap(facets = Facet) + 
+      scale_y_log10()+
+      scale_x_discrete(labels = c("A", "D", "I", "NA")) +
+      theme(legend.position="none") +
+      labs(title = Title)
+}
+
+grid.arrange(nrow = 2, (plot_abundance(ps3, Title = "Abundance", Color = "Type", variable = "Type")),
+             plot_abundance(ps4, Title = "Relative Abundance", Color = "Type", variable = "Type"))
+```
+
+# Data Exploration and Univariate Analysis.
+
+## About.
+This section again uses the [phyloseq](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0061217) package (along with several others) to explore the data using bar, violin and ordination plot. This then leads into a collection of univariate analyses, including; alpha and beta diversity, and also taxonomic differential abundance.
+
+## Load required packages. 
+
+```{r, warning=F, message=F, results='hide'}
+sapply(c("BiocManager", "ggplot2", "ggforce", "vegan", "knitr", "dplyr", 
+         "phyloseq", "phyloseqGraphTest", "igraph", "ggnetwork", "nlme", 
+         "reshape2", "tidyverse", "plyr", "DESeq2", "sjPlot", "ggpubr", 
+         "gridExtra", "grid", "gtable", "lazyeval"), require, character.only = TRUE)
+```
+
+## Taxanomic distribution.
+
+### Violin plots.
+ - Use previously defined violin plots to explore distributions of taxa.
+ - If a bimodal distribution is observed we can subset the data to determine if there is a taxonomic explination.
+ - Considerations: arguments can be altered for exploration.
+ 
+```{r, warning=F, message=F, fig.cap="Violin plots exploring of distribution of abundances within Lactoacillales. Annotation for x axis; A: Admission, D: Discharge & I: Intermediate."}
+subset_taxa(ps4, Order == "Lactobacillales") %>%
+plot_abundance(Facet = "Genus", Color = "Type")
+```
+
+### Bar charts
+ - Use `plot_bar_auto()` function wrapped around phyloseq's `plot_bar()` to explore the distribution of taxa at the genus and phylum levels.
+ - Subset transformed data (relative abundance) to only the top20 taxa.
+ 
+```{r, warning=F, message=F, fig.cap="Bar plots of the taxonomic distribution (relative abundance) at phylum and genus levels.", results='hide'}
+top20 <- names(sort(taxa_sums(ps4.NICU_no_na), decreasing=TRUE))[1:20]
+ps.top20 <- prune_taxa(top20, ps4.NICU_no_na)
+
+plot_bar_auto <- function(ps, taxonomy){
+plot_bar(ps, fill = taxonomy) + 
+    facet_wrap(~Type, scales = "free_x") + 
+    labs(title = paste0("Level:", taxonomy), y = "Abundance") + 
+    theme(legend.position = "bottom", legend.title = element_blank(), 
+    axis.title.x = element_blank(), axis.text.x = element_blank(), 
+    axis.ticks = element_blank())
+}
+
+grid.arrange(plot_bar_auto(ps.top20, "Phylum"), 
+             plot_bar_auto(ps.top20, "Genus"), 
+             nrow = 2, heights = c (1,1.2))
+```
+
+ - For other levels of taxonomy, with the legend hiden using `legend.position = "none"`.
+ 
+```{r, warning=F, message=F, fig.cap="Bar plots of the taxonomic distribution (relative abundance) at class, order and family levels."}
+plot_bar_auto_no_legend <- function(ps, taxonomy){
+plot_bar(ps, fill = taxonomy) + 
+    facet_wrap(~Type, scales = "free_x") + 
+    labs(title = paste0("Level:", taxonomy), y = "Abundance") + 
+    theme(legend.position = "none", legend.title = element_blank(), 
+    axis.title.x = element_blank(), axis.text.x = element_blank(), 
+    axis.ticks = element_blank())
+}
+
+grid.arrange(plot_bar_auto_no_legend(ps.top20, "Class"), 
+             plot_bar_auto_no_legend(ps.top20, "Order"), 
+             plot_bar_auto_no_legend(ps.top20, "Family"),
+             nrow = 3)
+```
+
+### Calculate the number samples containing a given taxa `samples_with_taxa()` function.
+
+ - The function takes the phyloseq object, taxonomy level and taxanomic name (with the later two as strings). 
+ - It then gets the ASV name from the *phyloseq* `tax_table()` by filtering with *dply* and [*lazyeval*](https://cran.r-project.org/web/packages/lazyeval/index.html). ( *lazyeval* is needed because of two concepts;[non-standard evaluation](http://adv-r.had.co.nz/Computing-on-the-language.html) and [lazy evaluation](http://adv-r.had.co.nz/Functions.html#function-arguments).
+ - `paste()` is then used to concatenate the ASVs and `collapse` to insert the 'or' symbol.
+ - The function then matches the ASV names to the `otu_table()` of the *phyloseq* object to select the desired column(s) that represent the taxa of interest, and then counts the number of rows that have any of the selected taxa with counts greater than 0 to get the number of samples with that taxa present.
+ 
+```{r, warning=F, message=F,eval=F}
+samples_with_taxa <- function(ps_object, taxonomy_level, taxa){
+ ASV <- tax_table(ps_object) %>% 
+        unclass() %>% 
+        as.data.frame() %>% 
+        filter_(interp(~y == x, .values=list(y = as.name(taxonomy_level), x = taxa))) %>%
+        row.names() %>%
+        paste(collapse = " | ")
+  
+   otu_table(ps_object) %>% 
+        as.data.frame() %>% 
+        select(matches(ASV)) %>% 
+        filter_all(any_vars( . > 0)) %>%  
+        nrow()
+}
+
+samples_with_taxa(ps4.NICU_no_na, "Genus", "Bifidobacterium")
+```
+
+## Beta diversity
+ - Use distance and ordination methods to explore the relationship between metadata.
+ - We calculate the distances using pruned, transformed and non-agglomerated data.
+
+```{r, warning=F, message=F}
+ps2.NICU_no_na <- subset_samples(ps2, Primary_Group == "NICU" & 
+        (Type == "Admission" | Type == "Discharge")) %>%
+        transform_sample_counts(function(x) x / sum(x))
+```
+ 
+ - We can then create distance matrices and plots for this data subset using several methods:
+  - bray-curtis or weighted unifrac distances with principle coordinate analysis (PCoA).
+    - weighted-unifrac: phylogeny.
+    - bray-curtis: abundance and phylogeny.
+ - Ordinate using PCoA and Weighted-Unifrac/Bray-Curtis.
+ - Extract eigenvalues from ordination.
+ - Plot ordination using eigenvalues and colour by variable *Type*.
+    
+### PCoA and Bray-Curtis.
+
+```{r, fig.cap="PCoA plot of Bray-Curtis matrix", warning=F, message=F}
+ps_ordination <- ordinate(ps2.NICU_no_na, method = "PCoA", distance = "bray")
+
+evals <- ps_ordination$values$Eigenvalues
+
+plot_ordination(ps2.NICU_no_na , ps_ordination, color = "Type", 
+  title = "PCoA (Bray-Curtis)") +
+  labs(col = "Type") +
+  coord_fixed(sqrt(evals[2] / evals[1])) +
+  geom_point(size = 2)+
+  stat_ellipse(type = "norm", linetype = 2)
+```
+
+### PCoA and Weighted-Unifrac.
+
+```{r, fig.cap="PCoA plot of Weighted-Unifrac matrix", warning=F, message=F}
+ps_ordination <- ordinate(ps2.NICU_no_na, method = "PCoA", distance = "wunifrac")
+
+evals <- ps_ordination$values$Eigenvalues
+
+plot_ordination(ps2.NICU_no_na , ps_ordination, color = "Type", 
+  title = "PCoA (Weighted-Unifrac)") +
+  labs(col = "Type") +
+  coord_fixed(sqrt(evals[2] / evals[1])) +
+  geom_point(size = 2)+
+  stat_ellipse(type = "norm", linetype = 2)
+```
+
+
+### Is the overlap the result of collection date? i.e. late admission and early discharge samples overlap?
+
+ - Create a new column in the metadata table that is the collection date minus the date of birth.
+ 
+```{r, fig.cap="PCoA plot of Bray-Curtis matrix coloured by days since birth the collection occured.", warning=F, message=F}
+sample_data(ps2.NICU_no_na) <- ps2.NICU_no_na %>% 
+  sample_data() %>% 
+  unclass() %>% 
+  as.data.frame() %>% 
+  mutate_at(7:8, as.character) %>% 
+  mutate_at(7:8, as.numeric) %>% 
+  mutate(Days_since_birth = Date_Collected-Date_of_Birth) %>% 
+  mutate("Label2" = Label) %>% 
+  column_to_rownames("Label2")
+
+ps_ordination <- ordinate(ps2.NICU_no_na, method = "PCoA", distance = "bray")
+
+evals <- ps_ordination$values$Eigenvalues
+
+plot_ordination(ps2.NICU_no_na , ps_ordination, color = "Days_since_birth", shape = "Type", 
+  title = "PCoA (Bray-Curtis)") +
+  coord_fixed(sqrt(evals[2] / evals[1])) +
+  geom_point(size = 3.5) +
+  stat_ellipse(type = "norm", linetype = 2)
+```
+
+ - Export plots.
+ 
+```{r, eval=F}
+ggsave("PCoA_Weighted-Unifrac.png", 
+  plot = (plot_ordination(ps2.NICU_no_na , ps_ordination, 
+  color = "Type", title = "PCoA (Weighted-Unifrac)") +
+  labs(col = "Type") +
+  coord_fixed(sqrt(evals[2] / evals[1])) +
+  geom_point(size = 2)+
+  stat_ellipse(type = "norm", linetype = 2)), dpi = 600, height = 5, width = 5)
+```
+
+### Statistical test: PERMANOVA.
+ - Preforming permutational anova for group-level (*Type* of sample) differences based on dissimilarity.
+ - Extract otu table and metadata from phyloseq object.
+ - Use `adonis()` from the *vegan* package to perform the PERMANOVA.
+ 
+```{r, warning=F, message=F}
+ps_otu <- data.frame(otu_table(ps2.NICU_no_na))
+ps_samp <- data.frame(sample_data(ps2.NICU_no_na))
+
+permanova <- adonis(ps_otu ~Type, data = ps_samp, method = "bray")
+as.data.frame(permanova$aov.tab)
+```
+
+ - Significant PERMANOVA means one of three things:
+  - there is a difference in the location of the samples (i.e. the average community composition).
+  - there is a difference in the dispersion of the samples (i.e. the variability in the community composition).
+  - there is a difference in both the location and the dispersion.
+ - If you get a significant PERMANOVA you'll want to distinguish between the three options by checking the homogeneity condition using `permdisp()`. If you get a non-significant result the first option above is correct.
+ 
+```{r, warning=F, message=F}
+dist <- vegdist(ps_otu)
+as.data.frame(anova(betadisper(dist, ps_samp$Type)))
+```
+ 
+ - `betadisper()` gives a measure of the dispersion within groups. Thus, if the PERMANOVA test is significant and the permdisp is not, the significant result in your communities is due to a mean shift in community composition and not from increased variance within groups.
+ 
+ - Export results.
+ 
+```{r, eval=F}
+tab_df((as.data.frame(permanova$aov.tab)), 
+       alternate.rows = TRUE, 
+       title = "PERMANOVA: Admission vs Discharge", 
+       file = "PERMANOVA_ADvsDIS.doc")
+
+tab_df((as.data.frame(anova(betadisper(dist, ps_samp$Type)))), 
+       alternate.rows = TRUE, 
+       title = "Homogeneity (PERMANOVA): Admission vs Discharge", 
+       file = "Homogeneity_PERMANOVA_ADvsDIS.doc")
+```
+
+ - Explore the major contributors to the differences.
+
+```{r, warning=F, message=F}
+coef <- coefficients(permanova)["Type1",]
+top.coef <- coef[rev(order(abs(coef)))[1:20]]
+
+major_contributors <- tax_table(ps2.NICU_no_na) %>% 
+    unclass() %>% 
+    as.data.frame() %>% 
+    select("Genus", "Species") %>% 
+    rownames_to_column(var = "ASV") %>% 
+    right_join((as.data.frame(top.coef) %>%
+    rownames_to_column(var = "ASV"))) %>% 
+    select(!"ASV") 
+```
+
+ - Export table.
+ 
+```{r, eval=F}
+tab_df(major_contributors , alternate.rows = TRUE, 
+       title = "Major Contriutors to PERMANOVA differences.", 
+       file = "Major_contributors_beta_diversity.doc")
+```
+
+
+## Alpha diversity.
+ - Subset ps2 to exclude SCN and NA values.
+ - Estimate richness and save as object.
+ - Remove chao1 standard error column and "X" from row names.
+ - Create a new variable column with rownames.
+ - Merge alpha diversity estimates (*ps_alpha_div*) with the metadata (*samdf*) by the *Label* column (orignially row names), for downstream analysis.
+ 
+```{r, warning=F, message=F}
+ps.NICU_no_na <- subset_samples(ps2, 
+              Primary_Group == "NICU" & 
+              (Type == "Admission" | Type == "Discharge"))
+
+ps_alpha_div <- ps.NICU_no_na %>%
+              estimate_richness(measures = c("Shannon", "Observed", "Chao1")) %>%
+              subset(select =  -se.chao1)
+
+rownames(ps_alpha_div) <- sub("X", "", rownames(ps_alpha_div))
+
+ps_alpha_div$Label <- rownames(ps_alpha_div) %>%
+              as.factor()
+
+ps_samp <- samdf %>%
+              filter(Primary_Group == "NICU" & 
+              (Type == "Admission" | Type == "Discharge")) %>% 
+              right_join(ps_alpha_div, by = "Label") %>%
+              as.data.frame()
+```
+
+ - Create histogram to examine distribution.
+ 
+```{r, warning=F, message=F}
+# To determine if diveristy is normally distributed
+ggplot(ps_samp, aes(x = Shannon)) + geom_histogram() + 
+       xlab("Alpha Diversity") + ylab("Count")
+```
+
+ - Test for normality.
+ 
+```{r, warning=F, message=F, eval=F}
+shapiro.test(ps_samp$Shannon)
+```
+ 
+ ### Statistical test: compare mean/median bteween admission and discharge samples.
+ 
+ - Combine the outputs.
+ 
+```{r, warning=F, message=F}
+Shannon <- compare_means(Shannon ~ Type, data = ps_samp, 
+                         method = "wilcox.test", p.adjust.method = "fdr")
+Observed <- compare_means(Observed ~ Type, data = ps_samp, 
+                          method = "wilcox.test", p.adjust.method = "fdr")
+Chao1 <- compare_means(Chao1 ~ Type, data = ps_samp, 
+                       method = "wilcox.test", p.adjust.method = "fdr")
+
+Diversity_Analysis <- bind_rows(Shannon, Observed, Chao1) %>%
+  rename(c(".y." = "Diversity Measure"))
+
+Diversity_Analysis
+```
+
+ - Export *Diversity_Analysis* results table.
+ 
+```{r, eval=F}
+tab_df(Diversity_Analysis, alternate.rows = TRUE, 
+       title = "Diversity Analysis: Admission Vs Discharge", 
+       file = "Alpha_Diversity_Analysis_Type.doc")
+```
+
+### Plot alpha diversity.
+
+ - Use `plot_richness()` from *phyloseq*, which estimates alpha diversity metrics using *vegan* and plots them, taking standard *ggplot2* *geoms_* for the plot design.
+ 
+```{r, warning=F, message=F, fig.cap="Scatterplot of richness and shannon diversity metrics coloured by the type of sample."}
+plot_richness(ps.NICU_no_na, measures = c("Shannon", "Observed"), 
+              color = "Type", title = "") +
+    geom_point(size = 3.5, alpha = 0.7) +
+    theme(axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), 
+          panel.border = element_rect(colour = "grey", fill = NA, size = 1))
+```
+
+ - Export scatterplot.
+ 
+```{r, eval=F}
+ggsave("Alpha_Point.png", dpi = 600, height = 5, width = 5)
+```
+
+ - Use `plot_richness()` to create boxplots of alpha diversity.
+ - To add a layer with p values use `stat_compare_means(comparisons = list(c("Admission", "Discharge")), method = "wilcox.test")`.
+ 
+```{r, warning=F, message=F, fig.cap="Boxplots of richness and shannon diversity metrics coloured by the type of sample."}
+plot_richness(ps.NICU_no_na, measures = c("Shannon", "Observed"), x = "Type", color = "Type", title = "") +
+    geom_point(size = 1, alpha = 0.7) +
+    geom_boxplot() +
+    theme(panel.border = element_rect(colour = "grey", fill = NA, size = 1)) 
+```
+
+ - Export boxplot.
+ 
+```{r, eval=F}
+ggsave("Alpha_Box.png", dpi = 600, height = 5, width = 5)
+```
+
+ - Explore the distribution of alpha diversity across the two groups using a histogram.
+ - Calculate mean and medians for shannon diversity to be used for dotted lines in histogram.
+
+```{r, warning=F, message=F, fig.cap="Histogram showing the distribution of the shannon index scores across samples, coloured by sample type and with lines representing the mean (dashed) and median (solid)."}
+div_med <- ddply(ps_samp, "Type", summarise, grp.med = median(Shannon))
+div_mean <- ddply(ps_samp, "Type", summarise, grp.mean = mean(Shannon))
+
+ggplot(ps_samp, aes(x = Shannon, color = Type)) + 
+  geom_histogram(alpha = 0.25, position="dodge") + 
+  labs(title = "", x = "Shannon Index", y = "Sample count") +
+  geom_vline(data = div_mean, aes(xintercept = grp.mean, color = Type), 
+             linetype = "dashed") +
+  geom_vline(data = div_med, aes(xintercept = grp.med, color = Type), 
+             linetype = "solid") +
+  theme(panel.border = element_rect(colour = "grey", fill = NA, size = 1))
+```
+
+ - The admission outliers in red may explain why were not seeing the significant differences in diversity.
+
+ - Export histogram.
+ 
+```{r, eval=F}
+ggsave("Alpha_Distribution.png", dpi = 600, height = 5, width = 10)
+```
+
+## Taxonomic abundance with [*DESeq2*](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-014-0550-8).
+ - Subset to filtered/agglomerated data.
+ - Convert from *phyloseq* to *deseq* object.
+ - To perform analysis at other levels of taxonomy use `tax_glom(ps2, "Phylum", NArm = TRUE)` prior to running the chunk below.
+ 
+```{r, warning=F, message=F}
+ps.NICU <- subset_samples(ps3, Primary_Group == "NICU" & 
+        (Type == "Admission" | Type == "Discharge")) 
+
+ps.NICU.deseq = phyloseq_to_deseq2(ps.NICU, ~Type)
+```
+
+ - Define function for calculating geometric means.
+ - Calculate geometric means, and subsetuently estimate size factors.
+ 
+```{r, warning=F, message=F}
+gm_mean = function(x, na.rm = TRUE){
+  exp(sum(log(x[x > 0]), na.rm = na.rm) / length(x))
+}
+
+geoMeans <- apply(counts(ps.NICU.deseq), 1, gm_mean)
+
+ps.NICU.deseq <- estimateSizeFactors(ps.NICU.deseq, geoMeans = geoMeans) 
+```
+
+ - Construct histograms to compare pre and post transformation.
+ - Call `estimateDispersions()` to calculate abundances with `getVarianceStabilizedData()`.
+ - **NB.** the samples are in columns in the *deseq* object but in rows for the *phyloseq* object.
+ - Axis adujsted for what best represents the distribution.
+ 
+```{r, warning=F, message=F, fig.cap="Pre and post transformation of taxonomic counts with DESeq2"}
+ps.NICU.deseq <- estimateDispersions(ps.NICU.deseq, fitType = "local")  
+
+abund_sums_trans <- data.frame(sum = colSums(getVarianceStabilizedData(ps.NICU.deseq) ), 
+                     sample = colnames(getVarianceStabilizedData(ps.NICU.deseq) ), 
+                     type = "DESeq2")
+
+abund_sums_no_trans <- data.frame(sum = rowSums(otu_table(ps.NICU)), 
+                       sample = rownames(otu_table(ps.NICU)), 
+                       type = "None")
+
+grid.arrange((ggplot(abund_sums_trans) +
+  geom_histogram(aes(x = sum), binwidth = 1) +
+  xlab("Abundance within sample") +
+  xlim(NA, 300) +
+  ylim(0,6) +
+  ggtitle("DESeq2 transformation")),
+  (ggplot(abund_sums_no_trans) +
+  geom_histogram(aes(x = sum), binwidth = 200) +
+  xlab("Abundance within sample") +
+  ylim(0,5) +
+  ggtitle("No transformation")),
+  nrow = 2)
+```
+
+### Statisical test: calculate differential abundances with *DESeq2*.
+
+ - Use `DESeq()` to perform differential expression analysis based on the negative binomial distribution.
+ - The function estimates size factors, estimates dispersion, fits a negative binomial GLM and performs a Wald test.
+ - Extract the results, order by p value, select only significant (<0.05) results, bind this data to the *tax_table* from the *phyloseq* object to get the taxonomic information, and then select and order the desired columns.
+ 
+```{r, warning=F, message=F}
+ps.NICU.deseq = DESeq(ps.NICU.deseq, fitType = "local")
+res = results(ps.NICU.deseq, contrast = c("Type", "Discharge", "Admission"))
+res = res[order(res$padj, na.last = NA), ]
+alpha = 0.01
+sigtab = res[(res$padj < alpha), ] 
+sigtab = cbind(as(sigtab, "data.frame"), 
+         as(tax_table(ps.NICU)[rownames(sigtab), ], "matrix"))
+
+sigtab %>%
+  select("baseMean", "log2FoldChange", "lfcSE", "padj", 
+  "Phylum", "Class", "Order", "Family", "Genus") %>%
+  remove_rownames()  %>% 
+  kable()
+```
+
+ - Export results.
+ 
+```{r, eval=F}
+tab_df(posigtab, alternate.rows = TRUE, 
+       title = "Differential Abundance of Genera: Admission Vs Discharge", 
+       file = "Diff_Abundance_Genera.doc")
+```
+
+## Summary.
+
+ - Create a summary grid including alpha and beta diversity metrics, as well as differential abundance testing results.
+ 
+```{r, warning=F, message=F}
+#PCoA Plot
+ps_ordination <- ordinate(ps2.NICU_no_na , method = "PCoA", distance ="bray")
+
+evals <- ps_ordination$values$Eigenvalues
+
+PCoA_plot <- plot_ordination(ps2.NICU_no_na, ps_ordination, color = "Type") +
+             coord_fixed(sqrt(evals[2] / evals[1])) +
+             labs(col = "Type", title = "PCoA (Bray-Curtis)") +
+             geom_point(size = 2) +
+             stat_ellipse(type = "norm", linetype = 2) 
+  
+PCoA_plot <- annotate_figure(PCoA_plot, fig.lab = "A", 
+                             fig.lab.face = "bold", fig.lab.size = 20)
+
+# Alpha Diversity Plot
+alpha_plot <- plot_richness(ps.NICU_no_na, measures = c("Shannon", "Observed"), 
+              x = "Type", color = "Type", title = "Alpha Diversity") +
+              geom_point(size = 1, alpha = 0.7) +
+              geom_boxplot() +
+              theme(panel.border = element_rect(colour = "grey", fill = NA, size = 1), 
+              legend.position = "none", axis.text.y=element_blank())
+
+alpha_plot <- annotate_figure(alpha_plot, fig.lab = "B", 
+                              fig.lab.face = "bold", fig.lab.size = 20)
+
+# Differenital Abundance
+title <- textGrob("Differential Abundance", gp = gpar(fontsize = 15))
+
+padding <- unit(5,"mm")
+
+genus_df <- as.data.frame(sigtab) %>%
+            remove_rownames() %>%
+            add_column("p-adj" = c("***", "***", "***", "**", "**")) %>%
+            select("Genus","p-adj", "log2FoldChange","lfcSE") %>%
+            mutate_if(is.numeric, round, 2) %>% 
+            dplyr::rename("lfc" = log2FoldChange) %>%
+            tableGrob(rows = NULL) %>%
+            gtable_add_rows(heights = grobHeight(title) + padding, pos = 0) %>%
+            gtable_add_grob(title, 1, 1, 1, 4)
+
+genus_df <- annotate_figure(genus_df, fig.lab = "C", 
+                            fig.lab.face = "bold", fig.lab.size = 20)
+
+# grid layout
+lay <- rbind(c(1,2), 
+             c(3,2))
+
+grid.arrange(PCoA_plot, alpha_plot, genus_df, nrow = 2, layout_matrix = lay)
+```
+
+# Finished
