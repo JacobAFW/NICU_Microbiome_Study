@@ -1,7 +1,7 @@
 # NICU_Microbiome_Study
 Microbiome analysis and associated data.
 
-This repo contains supplementary data for the manuscript "Characterising the bacterial gut microbiome of very preterm infants". 
+This repo contains supplementary data for the manuscript "The bacterial gut microbiome of probiotic-treated very-preterm infants: changes from admission to discharge" (https://www.nature.com/articles/s41390-021-01888-7). 
 This includes: 
 
  - The full workflow, from raw reads to analysis. 
